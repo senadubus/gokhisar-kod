@@ -1,4 +1,4 @@
-"""4.2.2.1 Hedef Tespit Modülü — YOLOv8s tabanlı tespit.
+"""Hedef Tespit Modülü — YOLOv8s tabanlı tespit.
 
 DETECT durumunda kare içindeki maket ve balon hedefleri tespit eder;
 her hedef için (sınıf, sınır kutusu, güven skoru) üretir. Çıktılar ön
