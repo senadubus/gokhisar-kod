@@ -153,3 +153,674 @@ Sahada ayarlanması gerekenler (hepsi `pc/config.py` ve `rpi/` içinde):
 artırın → salınımı sönümleyene dek `Kd` ekleyin → kalıcı hata varsa çok küçük `Ki`.
 
 ---
+# Performans Ölçüm Kodu Analizi
+
+
+## 1. FPS Ölçümleri
+
+Kodda dört ayrı FPS değeri ölçülmektedir:
+
+| Ölçüm | Kod adı | Açıklama |
+|---|---|---|
+| Kamera FPS | `camera_fps` | Kamera tarafında üretilen kare hızı |
+| Network RX FPS | `network_rx_fps` | Ağ üzerinden alınan kare hızı |
+| Processing FPS | `processing_fps` | İşlemesi tamamlanan kare hızı |
+| GUI FPS | `gui_fps` | Arayüzde gösterilen kare hızı |
+
+`FPSMeter` sınıfı son 2 saniyelik kayan pencere üzerinden FPS hesabı yapar.
+
+Örnek gösterimi:
+
+```text
+CAM       30.0 FPS
+NET       29.7 FPS
+AI        24.4 FPS
+GUI       24.2 FPS
+```
+
+---
+
+## 2. Frame Sayaçları ve Frame Kaybı
+
+Kod aşağıdaki sayaçları tutmaktadır:
+
+```text
+camera_frames
+received_frames
+processed_frames
+dropped_frames
+queue_overwrites
+frame_drop_percent
+```
+
+Frame drop yüzdesi şu mantıkla hesaplanır:
+
+```text
+FrameDrop % = DroppedFrames / CameraFrames × 100
+```
+
+`queue_overwrite()` çağrıldığında hem queue overwrite sayacı hem de dropped frame sayacı artmaktadır.
+
+---
+
+## 3. Preprocessing Süresi
+
+Aşağıdaki iki çağrı arasındaki süre ölçülmektedir:
+
+```python
+preprocess_start(frame_id)
+preprocess_end(frame_id)
+```
+
+Bu ölçüm model öncesi işlemleri kapsayabilir:
+
+- Resize
+- Renk dönüşümü
+- Tensor hazırlama
+- Normalizasyon
+
+Kod aşağıdaki istatistikleri üretir:
+
+```text
+mean
+min
+max
+std
+p50
+p95
+p99
+```
+
+---
+
+## 4. Inference Süresi
+
+Aşağıdaki iki çağrı arasındaki süre ölçülmektedir:
+
+```python
+inference_start(frame_id)
+inference_end(frame_id)
+```
+
+Bu değer model çıkarım süresini verir.
+
+Örnek:
+
+```text
+Inference Mean   24.8 ms
+Inference P95    28.7 ms
+Inference P99    34.2 ms
+```
+
+Not: Kod son inference süresini ayrı bir değişken olarak tutmaz. `LatencyMeter`, son 1000 örneği saklar ve bunların istatistiklerini üretir.
+
+---
+
+## 5. Postprocessing Süresi
+
+Aşağıdaki iki çağrı arasındaki süre ölçülmektedir:
+
+```python
+postprocess_start(frame_id)
+postprocess_end(frame_id)
+```
+
+Bu aşama örneğin şunları içerebilir:
+
+- Model çıktılarının okunması
+- Bounding box işleme
+- Class bilgisi işleme
+- Tracking için veri hazırlama
+
+Yine `mean`, `min`, `max`, `std`, `p50`, `p95`, `p99` değerleri hesaplanır.
+
+---
+
+## 6. Toplam Frame Processing Süresi
+
+Kodda `frame_processing_latency` metriği vardır.
+
+Bu değer:
+
+```text
+network frame received
+        ↓
+preprocess
+        ↓
+inference
+        ↓
+postprocess complete
+```
+
+arasındaki toplam süreyi ölçer.
+
+Kabaca:
+
+```text
+T_processing = T_postprocess_end - T_network_receive
+```
+
+UI'da şu şekilde gösterilebilir:
+
+```text
+VISION
+Processing      35 ms
+Inference       27 ms
+Preprocess       4 ms
+Postprocess      2 ms
+```
+
+---
+
+## 7. Video / Network Frame Gecikmesi
+
+Kodda:
+
+```text
+network_frame_latency
+```
+
+metriği vardır.
+
+Bu değer `camera_frame()` ile `network_frame_received()` arasındaki farktan hesaplanır.
+
+Ancak burada önemli bir dikkat noktası vardır:
+
+- `camera_frame()` Raspberry Pi üzerinde
+- `network_frame_received()` PC üzerinde
+
+çalışıyorsa ve iki cihaz da kendi `time.perf_counter_ns()` değerini kullanıyorsa bu timestamp'ler doğrudan karşılaştırılamaz.
+
+Bu nedenle cihazlar arası gerçek video gecikmesini ölçmek için ortak saat senkronizasyonu veya paket içine wall-clock timestamp eklenmesi gerekir.
+
+---
+
+## 8. TCP Gecikmesi
+
+TCP tarafında:
+
+```python
+sender_timestamp_ns
+receiver_ns = time.time_ns()
+```
+
+kullanılarak gecikme hesaplanmaktadır.
+
+Bu yaklaşım ancak gönderici ve alıcı cihazların saatleri senkronize ise anlamlıdır.
+
+Örneğin NTP/PTP senkronizasyonu yoksa ölçüm gerçek network latency değerine saat farkını da ekleyebilir.
+
+---
+
+## 9. Network Veri Aktarım Hızı
+
+Kod aşağıdaki değerleri ölçer:
+
+```text
+network_tx_mbps
+network_rx_mbps
+```
+
+`psutil.net_io_counters()` kullanılarak gönderilen/alınan byte farkı zamana bölünür.
+
+Formül:
+
+```text
+Mbps = ΔBytes × 8 / Δt / 1,000,000
+```
+
+Dikkat: Bu değer yalnızca video trafiğini değil, seçilen network interface üzerindeki tüm trafiği kapsar.
+
+---
+
+## 10. CPU Ölçümleri
+
+Kod iki ayrı CPU metriği verir:
+
+```text
+cpu_percent
+process_cpu_percent
+```
+
+### `cpu_percent`
+Sistemin genel CPU kullanımını gösterir.
+
+### `process_cpu_percent`
+Sadece çalışan Python uygulamasının CPU kullanımını gösterir.
+
+---
+
+## 11. RAM Ölçümleri
+
+Kod şu değerleri ölçer:
+
+```text
+ram_percent
+ram_used_mb
+process_ram_mb
+```
+
+Bunlar sırasıyla:
+
+- Sistem RAM kullanım yüzdesi
+- Kullanılan toplam RAM
+- Uygulamanın kullandığı RAM
+
+değerlerini verir.
+
+`process_ram_mb` uzun süreli testlerde memory leak gözlemlemek için faydalıdır.
+
+---
+
+## 12. GPU Ölçümleri
+
+NVIDIA GPU mevcutsa kod şu metrikleri verir:
+
+```text
+gpu_usage
+gpu_memory_usage
+gpu_temperature
+```
+
+Notlar:
+
+- Yalnızca NVIDIA GPU için çalışır.
+- Varsayılan olarak `GPU 0` izlenir.
+- Çoklu GPU sisteminde diğer GPU'lar izlenmez.
+
+---
+
+## 13. Raspberry Pi / CPU Sıcaklığı
+
+Kod:
+
+```text
+temperature_c
+```
+
+değerini üretir.
+
+Öncelikle:
+
+```text
+/sys/class/thermal/thermal_zone0/temp
+```
+
+okunur.
+
+Bu başarısız olursa:
+
+```text
+vcgencmd measure_temp
+```
+
+komutu denenir.
+
+Raspberry Pi üzerinde sıcaklık takibi için uygundur.
+
+---
+
+## 14. TCP Bağlantı Sağlığı
+
+TCP için şu metrikler tutulur:
+
+```text
+tcp_messages
+tcp_errors
+tcp_reconnects
+tcp_age_ms
+tcp_state
+```
+
+`tcp_age_ms`, son TCP mesajı geleli geçen süreyi gösterir.
+
+Durum mantığı:
+
+```text
+< 500 ms        RECEIVING
+500–2000 ms     STALE
+> 2000 ms       DISCONNECTED
+```
+
+Bu değer UI için oldukça uygundur.
+
+---
+
+## 15. LiDAR Ölçümleri
+
+Kod şu LiDAR metriklerini üretir:
+
+```text
+lidar_samples
+lidar_valid_percent
+lidar_invalid_samples
+lidar_timeouts
+lidar_distance
+lidar_age_ms
+lidar_state
+```
+
+Örnek UI:
+
+```text
+LiDAR
+RECEIVING
+
+Distance     6243 mm
+Valid         99.7 %
+Age             8 ms
+Timeout          2
+```
+
+Eksik nokta:
+
+```text
+LiDAR Hz
+```
+
+şu anda hesaplanmamaktadır.
+
+---
+
+## 16. UART Ölçümleri
+
+UART tarafında şu değerler tutulur:
+
+```text
+uart_tx
+uart_rx
+uart_checksum_errors
+uart_invalid_frames
+uart_timeouts
+uart_success_percent
+uart_age_ms
+uart_state
+```
+
+Örnek:
+
+```text
+STM32 UART
+RECEIVING
+
+TX          18453
+RX          18440
+Checksum        0
+Invalid         2
+Timeout         1
+Success      99.9 %
+Age           9 ms
+```
+
+---
+
+## 17. Application Error Sayısı
+
+Kod:
+
+```python
+application_error()
+```
+
+çağrıldığında:
+
+```text
+application_errors
+```
+
+sayacını artırır.
+
+Exception handler'lara bağlanarak toplam uygulama hata sayısı takip edilebilir.
+
+---
+
+## 18. Tanımlı Olup Gerçekte Kullanılmayan Metrikler
+
+Kodda şu nesneler tanımlıdır:
+
+```python
+self.lidar_age = LatencyMeter()
+self.uart_latency = LatencyMeter()
+```
+
+Ancak bunlara veri ekleyen `.add_ms(...)` çağrıları bulunmamaktadır.
+
+Bu nedenle:
+
+- Gerçek LiDAR latency istatistiği ölçülmüyor.
+- Gerçek UART latency istatistiği ölçülmüyor.
+
+Önemli ayrım:
+
+```text
+LiDAR Age ≠ LiDAR Latency
+UART Age  ≠ UART Latency
+```
+
+`Age`, son veri geleli geçen süreyi ifade eder.
+
+---
+
+## 19. Network Packet Sayaçları Kullanılmıyor
+
+Kodda:
+
+```python
+self.network_packets
+self.network_packet_errors
+```
+
+tanımlıdır.
+
+Ancak bu sayaçlar artırılmadığı ve `snapshot()` içine eklenmediği için şu anda gerçek anlamda kullanılmamaktadır.
+
+Dolayısıyla:
+
+```text
+Packet Count
+Packet Error
+Packet Loss %
+```
+
+ölçümleri mevcut değildir.
+
+---
+
+## 20. Network Jitter Yok
+
+Kodda:
+
+```text
+network_rx_mbps
+video_latency
+FPS
+```
+
+bulunmasına rağmen:
+
+```text
+packet jitter
+frame arrival jitter
+```
+
+ölçümleri bulunmamaktadır.
+
+UDP/RTP video akışı için ayrıca eklenebilir.
+
+---
+
+## 21. GUI Latency Yok
+
+Kod `gui_ns` timestamp'ini saklar ancak bunun üzerinden herhangi bir gecikme metriği hesaplamaz.
+
+Dolayısıyla:
+
+```text
+GUI FPS
+```
+
+vardır fakat:
+
+```text
+GUI render latency
+processing → GUI latency
+camera → GUI latency
+```
+
+ölçümleri yoktur.
+
+---
+
+## 22. Görüntü Kalitesi Ölçümleri Yok
+
+Kod görüntü performansını ölçer ancak görüntü kalitesi için şu metrikler bulunmamaktadır:
+
+```text
+Blur
+Sharpness
+Brightness
+Contrast
+Exposure
+Image Noise
+SNR
+```
+
+Sistem UI'ında gerekirse özellikle:
+
+```text
+Brightness
+Sharpness / Blur
+```
+
+değerleri saniyede bir kez hesaplanabilir.
+
+---
+
+# 23. Tam Ölçüm Özeti
+
+| Grup | Ölçüm | Durum |
+|---|---|---|
+| Video | Camera FPS | ✅ |
+| Video | Received FPS | ✅ |
+| Video | Processing FPS | ✅ |
+| Video | GUI FPS | ✅ |
+| Frame | Camera frame count | ✅ |
+| Frame | Received frame count | ✅ |
+| Frame | Processed frame count | ✅ |
+| Frame | Dropped frames | ✅ |
+| Frame | Drop % | ✅ |
+| Queue | Queue overwrite | ✅ |
+| Processing | Preprocess latency | ✅ |
+| Processing | Inference latency | ✅ |
+| Processing | Postprocess latency | ✅ |
+| Processing | Total processing latency | ✅ |
+| Network | TX Mbps | ✅ |
+| Network | RX Mbps | ✅ |
+| Network | Video latency | ⚠️ Cihazlar arası kullanımda dikkat |
+| Network | Packet loss | ❌ |
+| Network | Jitter | ❌ |
+| TCP | Message count | ✅ |
+| TCP | Error count | ✅ |
+| TCP | Reconnect | ✅ |
+| TCP | Last data age | ✅ |
+| TCP | State | ✅ |
+| TCP | Latency | ⚠️ Saat senkronizasyonu gerekli |
+| LiDAR | Sample count | ✅ |
+| LiDAR | Valid % | ✅ |
+| LiDAR | Invalid count | ✅ |
+| LiDAR | Timeout | ✅ |
+| LiDAR | Distance | ✅ |
+| LiDAR | Data age | ✅ |
+| LiDAR | Status | ✅ |
+| LiDAR | Hz | ❌ |
+| UART | TX | ✅ |
+| UART | RX | ✅ |
+| UART | Checksum error | ✅ |
+| UART | Invalid frame | ✅ |
+| UART | Timeout | ✅ |
+| UART | Success % | ✅ |
+| UART | Data age | ✅ |
+| UART | Status | ✅ |
+| UART | Latency | ❌ |
+| Hardware | CPU | ✅ |
+| Hardware | Application CPU | ✅ |
+| Hardware | RAM | ✅ |
+| Hardware | Application RAM | ✅ |
+| Hardware | GPU | ✅ NVIDIA |
+| Hardware | VRAM | ✅ NVIDIA |
+| Hardware | GPU temperature | ✅ NVIDIA |
+| Hardware | Raspberry Pi temperature | ✅ |
+| Software | Application errors | ✅ |
+| Image | Sharpness | ❌ |
+| Image | Brightness | ❌ |
+| Image | Blur | ❌ |
+
+# 24. UI İçin Önerilen Ana Metrikler
+
+Ana operatör ekranında aşağıdaki metriklerin gösterilmesi yeterlidir:
+
+```text
+CAM FPS
+NET FPS
+AI FPS
+FRAME DROP %
+
+PROCESSING ms
+VIDEO DATA AGE / LATENCY
+
+NETWORK Mbps
+
+CPU
+GPU
+RAM
+RPi TEMP
+
+LiDAR
+ ├─ ONLINE
+ ├─ Hz
+ └─ Data Age
+
+TCP
+ ├─ STATUS
+ └─ Data Age
+
+STM32 UART
+ ├─ STATUS
+ ├─ Error
+ └─ Data Age
+```
+
+Daha ayrıntılı değerler Debug / Performance ekranına taşınabilir:
+
+```text
+p50
+p95
+p99
+queue overwrite
+checksum error
+reconnect count
+invalid frame
+timeout
+total counters
+```
+
+# 25. Genel Değerlendirme
+
+Kod güçlü bir başlangıçtır ve özellikle aşağıdaki alanları iyi kapsar:
+
+- FPS takibi
+- Görüntü işleme süreleri
+- Sistem kaynak kullanımı
+- TCP bağlantı sağlığı
+- LiDAR veri sağlığı
+- UART hata ve durum takibi
+
+Ancak tam bir gerçek zamanlı sistem sağlık ekranı için şu metriklerin eklenmesi önerilir:
+
+- LiDAR Hz
+- UART frame rate
+- UDP/RTP packet loss
+- Network jitter
+- Doğru cihazlar-arası video latency
+- GUI render latency
+- İsteğe bağlı görüntü kalitesi ölçümleri
