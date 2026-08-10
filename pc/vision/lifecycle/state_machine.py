@@ -37,6 +37,8 @@ class TargetRecord:
     lock_stable_frames: int = 0
     fired: bool = False
     fire_time: float = 0.0
+    miss_count: int = 0
+    last_conf: float = 1.0
 
 
 class TargetLifecycleManager:
@@ -90,23 +92,33 @@ class TargetLifecycleManager:
     # ---------- imha değerlendirme ----------
     def evaluate_destroyed(self, rec: TargetRecord,
                            target: TrackedTarget | None) -> bool:
-        """Üç koşulun eş zamanlı kontrolü."""
+        """Üç bağımsız koşulun EŞ ZAMANLI kontrolü:
+        1. (a) Yeniden tespit edilememe süresi (miss_count >= DESTROY_MISS_FRAMES)
+        2. (b) Takip zincirinin sonlanması / aşırı kayıp (target is None veya miss_count >= DESTROY_MISS_FRAMES)
+        3. (c) Güven skorunun imha eşiğinin altına düşmesi (last_conf < DESTROY_CONF_THRESHOLD)
+        """
         if not rec.fired:
             return False
 
-        cond_miss = (target is None or
-                     target.misses >= config.DESTROY_MISS_FRAMES)
-        cond_track_ended = target is None
-        cond_low_conf = (target is None or
-                         target.det.conf < config.DESTROY_CONF_THRESHOLD)
+        if target is not None:
+            rec.miss_count = target.misses
+            rec.last_conf = target.det.conf
+        else:
+            rec.miss_count += 1
+            rec.last_conf = 0.0
+
+        cond_miss = rec.miss_count >= config.DESTROY_MISS_FRAMES
+        cond_track_ended = (target is None) or (rec.miss_count >= config.DESTROY_MISS_FRAMES)
+        cond_low_conf = rec.last_conf < config.DESTROY_CONF_THRESHOLD
 
         if cond_miss and cond_track_ended and cond_low_conf:
             rec.state = TargetState.DESTROYED
             return True
 
-        # Koşullar tam sağlanmadı: kesin imha yok, yeniden takip/doğrulama
-        rec.state = TargetState.TRACK
-        rec.fired = False
+        # Koşullar tam sağlanmadı: hedef yeniden yüksek güvenle tespit edildiyse takibe dön
+        if target is not None and target.misses == 0 and target.det.conf >= config.DESTROY_CONF_THRESHOLD:
+            rec.state = TargetState.TRACK
+            rec.fired = False
         return False
 
     def drop(self, track_id: int):

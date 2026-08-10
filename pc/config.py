@@ -43,17 +43,19 @@ TRACK_LOW_CONF = 0.1
 TRACK_BUFFER = 30             # kayıp hedefin tutulacağı kare sayısı
 TRACK_MATCH_IOU = 0.8
 
-# ---------------- Değerlendirme / Önceliklendirme ----------------
-W_SIZE = 0.5                  # boyut ağırlığı
-W_STABILITY = 0.3             # takip kararlılığı ağırlığı
-W_SERVO = 0.2                 # servo düzeltme (az düzeltme = yüksek puan)
+# ---------------- Değerlendirme / Önceliklendirme (5 Ölçüt) ----------------
+W_SIZE = 0.35                  # hedef boyut ağırlığı
+W_CENTER = 0.25                # kamera merkezine yakınlık ağırlığı
+W_STABILITY = 0.20             # takip kararlılığı ağırlığı
+W_ENGAGEMENT = 0.10            # angajman uygunluğu ağırlığı (IFF)
+W_SERVO = 0.10                 # servo yönelim kararlılığı ağırlığı
 
 # ---------------- Kilitlenme ----------------
 LOCK_TOLERANCE_PX = 25        # görüntü merkezine tolerans yarıçapı
 LOCK_STABLE_FRAMES = 10       # kilit için gereken kararlı kare sayısı
 
 # ---------------- İmha Değerlendirme ----------------
-DESTROY_MISS_FRAMES = 45      # yeniden tespit edilememe süresi (kare)
+DESTROY_MISS_FRAMES = 15      # yeniden tespit edilememe süresi (kare) — TRACK_BUFFER (30) içinde kalmalı
 DESTROY_CONF_THRESHOLD = 0.2  # güven skoru eşiği
 
 # ---------------- Haberleşme (PC -> RPi) ----------------

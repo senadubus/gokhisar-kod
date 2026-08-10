@@ -55,12 +55,19 @@ Veri, her karede şu sırayla akar (hepsi `main.py` → `Pipeline.process`):
 
 ### 1. Tespit — `detection/`
 - `YoloDetector.detect(frame)` → `list[Detection]` (tam kare YOLOv8s)
-- `HsvBalloonDetector.detect(frame)` → küçük/uzak kırmızı balon adayları
-  (çift eşikli HSV maskesi → morfoloji → kontur → dairesellik ≥ 0.72)
-- Her HSV adayı için `dynamic_roi()` üretilir ve `YoloDetector.detect_in_roi()`
-  ile yeniden değerlendirilir (uzak hedefin etkin çözünürlüğünü artırır)
-- `detect_backup()`: performans düşüşünde YOLO'suz yedek boru hattı
-  (`Pipeline.backup_mode = True` ile devreye girer)
+
+- `HsvBalloonDetector`: HSV tabanlı iki farklı algoritmik mekanizma barındırır:
+  1. **Küçük Hedef Tespiti Algoritması (`detect` / `detect_under_object`)**:
+     Tam kare YOLO modeli nesneleri (maketleri) tespit eder. Eğer tespit edilen nesnenin altındaki balon bulunamazsa (30 frame dengesizliği veya LiDAR 10-15m + hareket şartı karşılandığında):
+     - **Aşama 1 (Model Çözümü)**: Nesnenin altındaki dinamik ROI bölgesinde (`lower_roi`) önce YOLO modeli ile balon tespiti denenir.
+     - **Aşama 2 (HSV Çözümü Fallback)**: Eğer YOLO modeli balon bulamazsa, HSV tabanlı çift eşikli maskeleme → morfolojik temizleme → kontur analizi çözümü uygulanarak (`detect_under_object`) nesne altındaki balon tespit edilir.
+     
+     **Tetiklenme Şartları:**
+     - **Şart 1 (Nesne-Balon Dengesizliği):** Görüntüde maket nesne var fakat altındaki balon eşleşmiyorsa bu durum **30 frame** boyunca sürdüğünde tetiklenir.
+     - **Şart 2 (LiDAR + Hareket):** Telemetriden gelen LiDAR mesafesi **10 – 15 metre** arasında ise VE görüntüde **hareketlilik** tespit edilirse tetiklenir.
+
+  2. **Yedek Balon Algılama Algoritması (`detect_backup`)**:
+     YOLO modelinin çökmesi veya sistem performans düşüşü durumlarında (`backup_mode = True`) devreye giren yedek mekanizmadır. YOLO olmadan aynı HSV boru hattı ile aday bölgeleri bulur; boyut, şekil ve en-boy oranı geometrik filtreleriyle yanlış pozitifleri eleyerek doğrulanan bölgeleri doğrudan takibe aktarır.
 
 **`Detection`** tüm sistemin ortak veri sınıfıdır: `x1,y1,x2,y2,conf,class_id,source`.
 `source` alanı `"yolo" | "hsv" | "yolo_roi"` olabilir; takipte kimlik
@@ -82,18 +89,20 @@ sürekliliği bu ortak format sayesinde korunur.
 - `stage=2` → balonlu tüm maketler doğrudan düşman
 
 ### 4. Takip — `tracking/tracker.py`
-- `TargetTracker.update(all_dets)`: YOLO + HSV tespitlerinin **birleşik listesi**
-  ByteTrack'e verilir; dönen `TrackedTarget` sözlüğü `track_id` anahtarlıdır
+- `TargetTracker.update(all_dets)`: YOLO + HSV tespitlerinin birleşik listesi `TRACK_LOW_CONF = 0.1` eşiğiyle filtrelenerek ByteTrack'e verilir.
+- **İki Turlu Eşleştirme (ByteTrack)**:
+  - 1. Tur: `TRACK_HIGH_CONF = 0.5` üzerindeki yüksek güvenli tespitler IoU + Macar (Hungarian) algoritması ile eşleştirilir.
+  - 2. Tur: `0.1 <= conf < 0.5` arasındaki düşük güvenli tespitler, Stage 1'de eşleşmeyen takiplerin telafi edilmesinde kullanılır (kayıp/perdelenmiş hedefleri kurtarır).
+  - `conf < 0.1` olan gürültü tespitleri önceden elenerek ölü sabit sorunu çözülmüştür.
 - Ölçüm yoksa `misses` artar; `TRACK_BUFFER = 30` kare sonunda hedef düşer
 - `ServoKalman`: ByteTrack'ten **bağımsız** ikinci Kalman filtresi; servoya
   giden merkez koordinatını yumuşatır (`update()` ölçümlü, `predict_only()` ölçümsüz)
 
 ### 5. Değerlendirme — `evaluation/prioritizer.py`
 ```
-puan = 0.5·boyut + 0.3·takip_kararlılığı + 0.2·servo_kararlılığı
+puan = 0.35·boyut + 0.25·merkez_yakınlığı + 0.20·takip_kararlılığı + 0.10·angajman_uygunluğu + 0.10·servo_kararlılığı
 ```
-Yalnızca DÜŞMAN doğrulanmış hedefler puanlanır; en yüksek puanlı hedef
-angajman adayıdır.
+Beş ölçütlü ağırlıklı formül kullanılarak puanlama yapılır. DÜŞMAN doğrulanmış hedefler arasında en yüksek puanlı hedef angajman adayı seçilir.
 
 ### 6. Yaşam Döngüsü — `lifecycle/state_machine.py`
 Aşağıdaki durum makinesini yönetir; kilit toleransını ve imha koşullarını denetler.

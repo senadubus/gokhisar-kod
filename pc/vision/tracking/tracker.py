@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+# pyrefly: ignore [missing-import]
 import supervision as sv
 
 import config
@@ -42,13 +43,19 @@ class TargetTracker:
 
     @staticmethod
     def _to_sv(detections: list[Detection]) -> sv.Detections:
-        """Birleşik tespit listesi -> supervision formatı."""
-        if not detections:
+        """Birleşik tespit listesi -> supervision formatı.
+
+        Gürültü tespiti önlemek için conf < TRACK_LOW_CONF (0.1) olanlar filtrelenir;
+        TRACK_LOW_CONF <= conf < TRACK_HIGH_CONF (0.1..0.5) arasındaki düşük güvenli
+        tespitler ByteTrack'in 2. tur telafi eşleştirmesinde kullanılır.
+        """
+        valid_dets = [d for d in detections if d.conf >= config.TRACK_LOW_CONF]
+        if not valid_dets:
             return sv.Detections.empty()
         return sv.Detections(
-            xyxy=np.array([d.as_xyxy() for d in detections]),
-            confidence=np.array([d.conf for d in detections]),
-            class_id=np.array([d.class_id for d in detections]),
+            xyxy=np.array([d.as_xyxy() for d in valid_dets]),
+            confidence=np.array([d.conf for d in valid_dets]),
+            class_id=np.array([d.class_id for d in valid_dets]),
         )
 
     def update(self, detections: list[Detection]) -> dict[int, TrackedTarget]:

@@ -38,13 +38,13 @@ from pc.integration.settings import PipelineSettings
 from shared.classes import BALLOON_CLASS_ID, MODEL_CLASS_IDS
 
 import config as vision_config
-from detection.hsv_detector import HsvBalloonDetector
-from detection.yolo_detector import Detection, YoloDetector
-from evaluation.prioritizer import TargetPrioritizer
-from iff.friend_foe import FriendFoeClassifier, IFFLabel
-from lifecycle.state_machine import TargetLifecycleManager, TargetState
-from tracking.tracker import ServoKalman, TargetTracker, TrackedTarget
-from validation.matcher import TargetMatcher
+from vision.detection.hsv_detector import HsvBalloonDetector
+from vision.detection.yolo_detector import Detection, YoloDetector
+from vision.evaluation.prioritizer import TargetPrioritizer
+from vision.iff.friend_foe import FriendFoeClassifier, IFFLabel
+from vision.lifecycle.state_machine import TargetLifecycleManager, TargetState
+from vision.tracking.tracker import ServoKalman, TargetTracker, TrackedTarget
+from vision.validation.matcher import TargetMatcher
 
 # Aynı nesnenin iki ayrı yoldan (tam kare + ROI) gelen kopyalarını eleme eşiği.
 _DEDUPE_IOU = 0.6
@@ -325,7 +325,21 @@ class VisionPipeline:
             else:
                 models = [d for d in yolo_dets if d.class_id in MODEL_CLASS_IDS]
                 balloons = [d for d in yolo_dets if d.class_id == BALLOON_CLASS_ID]
-                hsv_dets = self.hsv.detect(frame, num_objects=len(models), num_balloons=len(balloons))
+                triggered = self.hsv.update_condition(len(models), len(balloons), frame=frame)
+
+                if triggered:
+                    # Nesnesi tespit edilen ama altında balonu bulunamayan hedefleri bul
+                    unmatched_models = [
+                        m for m in models
+                        if not any(_iou(m, b) > 0.1 for b in balloons)
+                    ]
+                    for model in unmatched_models:
+                        # Nesnenin altına önce Model (YOLO), bulamazsa HSV çözümü uygula
+                        found = self.hsv.detect_under_object(frame, model, yolo_detector=self.yolo, remap_fn=self._remap)
+                        hsv_dets.extend(found)
+
+                    if not hsv_dets:
+                        hsv_dets = self.hsv.detect(frame, force=True)
 
         roi_dets: list[Detection] = []
         if (self.yolo is not None and self.settings.roi_refine
@@ -436,15 +450,15 @@ class VisionPipeline:
             self.lifecycle.on_iff(track_id, label)
 
     def _select_candidate(self, tracked: dict[int, TrackedTarget]) -> TrackedTarget | None:
-        """Angajman adayını seç — yalnızca düşman doğrulanmış hedefler yarışır."""
-        foes = []
+        """Angajman adayını 5 ölçütlü öncelik puanıyla seç."""
+        candidates_input = []
         for track_id, target in tracked.items():
             record = self.lifecycle.records.get(track_id)
             if record is None or record.iff is not IFFLabel.FOE:
                 continue
             if record.state in (TargetState.EVALUATE, TargetState.TARGET_LOCK):
-                foes.append(target)
-        candidate = self.prioritizer.select(foes)
+                candidates_input.append((target, record.iff))
+        candidate = self.prioritizer.select(candidates_input)
         if candidate is not None:
             self.lifecycle.on_selected_for_lock(candidate.track_id)
         return candidate
