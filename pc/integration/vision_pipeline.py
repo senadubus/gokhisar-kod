@@ -38,13 +38,13 @@ from pc.integration.settings import PipelineSettings
 from shared.classes import BALLOON_CLASS_ID, MODEL_CLASS_IDS
 
 import config as vision_config
-from vision.detection.hsv_detector import HsvBalloonDetector
-from vision.detection.yolo_detector import Detection, YoloDetector
-from vision.evaluation.prioritizer import TargetPrioritizer
-from vision.iff.friend_foe import FriendFoeClassifier, IFFLabel
-from vision.lifecycle.state_machine import TargetLifecycleManager, TargetState
-from vision.tracking.tracker import ServoKalman, TargetTracker, TrackedTarget
-from vision.validation.matcher import TargetMatcher
+from detection.hsv_detector import HsvBalloonDetector
+from detection.yolo_detector import Detection, YoloDetector
+from evaluation.prioritizer import TargetPrioritizer
+from iff.friend_foe import FriendFoeClassifier, IFFLabel
+from lifecycle.state_machine import TargetLifecycleManager, TargetState
+from tracking.tracker import ServoKalman, TargetTracker, TrackedTarget
+from validation.matcher import TargetMatcher
 
 # Aynı nesnenin iki ayrı yoldan (tam kare + ROI) gelen kopyalarını eleme eşiği.
 _DEDUPE_IOU = 0.6
@@ -108,7 +108,7 @@ class PipelineResult:
     destroyed_track_ids: list[int] = field(default_factory=list)
 
 
-class _RemappedYolo:
+class _RemappedYolo(YoloDetector):
     """`TargetMatcher`'a verilen, çıktısı config sınıf uzayına çevrilmiş dedektör.
 
     `TargetMatcher.match()` ikinci doğrulama yönteminde YOLO'yu balonun üst
