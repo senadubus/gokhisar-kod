@@ -226,6 +226,7 @@ class VisionPipeline:
         self.iff = FriendFoeClassifier(stage=self.stage)
         self.lifecycle = TargetLifecycleManager()
         self.servo_kalman = ServoKalman()
+        self.hsv.reset_condition()
         self._known_track_ids.clear()
         self._candidate_id = None
 
@@ -319,8 +320,12 @@ class VisionPipeline:
 
         hsv_dets: list[Detection] = []
         if self.settings.hsv_assist or self.backup_mode:
-            hsv_dets = (self.hsv.detect_backup(frame) if self.backup_mode
-                        else self.hsv.detect(frame))
+            if self.backup_mode:
+                hsv_dets = self.hsv.detect_backup(frame)
+            else:
+                models = [d for d in yolo_dets if d.class_id in MODEL_CLASS_IDS]
+                balloons = [d for d in yolo_dets if d.class_id == BALLOON_CLASS_ID]
+                hsv_dets = self.hsv.detect(frame, num_objects=len(models), num_balloons=len(balloons))
 
         roi_dets: list[Detection] = []
         if (self.yolo is not None and self.settings.roi_refine

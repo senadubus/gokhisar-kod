@@ -14,8 +14,32 @@ from detection.yolo_detector import Detection
 
 
 class HsvBalloonDetector:
-    def __init__(self):
+    def __init__(self, trigger_frame_threshold: int = 30):
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self.trigger_frame_threshold = trigger_frame_threshold
+        self.mismatch_frame_count = 0
+
+    def update_condition(self, num_objects: int, num_balloons: int) -> bool:
+        """30 frame (veya trigger_frame_threshold) boyunca nesne var ama
+        nesne sayısı ile balon sayısı eşit olmadığında tetiklenme şartını günceller.
+
+        - num_objects > 0 ve num_objects != num_balloons ise sayaç 1 artırılır.
+        - Nesne yoksa veya nesne sayısı balon sayısına eşitse sayaç 0'lanır.
+        - Sayaç trigger_frame_threshold eşiğine ulaştığında True döndürür.
+        """
+        if num_objects > 0 and num_objects != num_balloons:
+            self.mismatch_frame_count += 1
+        else:
+            self.mismatch_frame_count = 0
+        return self.mismatch_frame_count >= self.trigger_frame_threshold
+
+    def reset_condition(self) -> None:
+        """Sayaç durumunu sıfırlar."""
+        self.mismatch_frame_count = 0
+
+    def should_trigger(self, num_objects: int, num_balloons: int) -> bool:
+        """Tetiklenme şartının karşılanıp karşılanmadığını günceller ve döndürür."""
+        return self.update_condition(num_objects, num_balloons)
 
     # ---------- ortak HSV boru hattı ----------
     def _red_mask(self, frame: np.ndarray) -> np.ndarray:
@@ -49,9 +73,22 @@ class HsvBalloonDetector:
         return out
 
     # ---------- küçük hedef tespiti ----------
-    def detect(self, frame: np.ndarray) -> list[Detection]:
+    def detect(self, frame: np.ndarray,
+               num_objects: int | None = None,
+               num_balloons: int | None = None,
+               force: bool = False) -> list[Detection]:
         """HSV tabanlı balon adayları; merkez+yarıçaptan ortak sınır
-        kutusu formatına dönüştürülür."""
+        kutusu formatına dönüştürülür.
+
+        num_objects ve num_balloons belirtilirse (ve force=False ise),
+        yalnızca 30 frame boyunca nesne varlığı ve nesne-balon dengesizliği
+        (num_objects > 0 ve num_objects != num_balloons) korunduğunda tespit yapılır.
+        Parametreler belirtilmezse veya force=True ise koşulsuz tespit yapılır.
+        """
+        if not force and num_objects is not None and num_balloons is not None:
+            if not self.update_condition(num_objects, num_balloons):
+                return []
+
         mask = self._red_mask(frame)
         detections = []
         for cx, cy, r in self._candidates(mask):

@@ -39,6 +39,24 @@ def test_hsv_ignores_non_circular_shape():
     assert len(dets) == 0
 
 
+def test_hsv_trigger_requires_30_mismatch_frames():
+    detector = HsvBalloonDetector(trigger_frame_threshold=30)
+    frame = draw_circle(make_frame(), (640, 360), 30, (0, 0, 255))
+
+    # 29 frame boyunca nesne var (1) ama eşleşen balon yok (0)
+    for _ in range(29):
+        dets = detector.detect(frame, num_objects=1, num_balloons=0)
+        assert len(dets) == 0
+
+    # 30. frame'de şart sağlanır ve tespit çalışır
+    dets = detector.detect(frame, num_objects=1, num_balloons=0)
+    assert len(dets) == 1
+
+    # Nesne sayısı ile balon sayısı eşitlendiğinde (1 vs 1) sayaç sıfırlanır
+    assert detector.update_condition(num_objects=1, num_balloons=1) is False
+    assert detector.mismatch_frame_count == 0
+
+
 # ---------------- IFF zamansal oylama ----------------
 def test_iff_requires_multiple_consistent_frames():
     clf = FriendFoeClassifier(stage=3)
