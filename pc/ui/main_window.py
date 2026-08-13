@@ -20,11 +20,14 @@ import time
 from typing import Optional
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QStatusBar, QSizePolicy, QStackedWidget, QLabel, QPushButton, QFrame
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QApplication,
+    QStatusBar, QSizePolicy, QStackedWidget, QLabel, QPushButton, QFrame,
+    QDoubleSpinBox
 )
-from PySide6.QtCore import Qt, Slot, QTimer
+from PySide6.QtCore import Qt, Slot, QTimer, QEvent
 from PySide6.QtGui import QGuiApplication  # Boyutlandırma görevi için eklendi
+
+from shared import protocol
 
 from pc.ui.utils.config import UIConfig, SystemConfig
 from pc.ui.styles import Styles
@@ -48,6 +51,25 @@ from pc.ui.workers.vision_worker import VisionWorker
 _PAN_CENTER = 90.0
 _TILT_CENTER = 90.0
 _AZIMUTH_SCALE = 0.5
+
+# KTR 4.3.2: "MANUEL modda servo hareketleri operatör tarafından klavye
+# komutlarıyla doğrudan kontrol edilir." Bir tuş vuruşunun gösterge biriminde
+# kaç derece ilerlettiği. Azimut göstergesi ±180 olduğu ve RPi açı uzayında
+# yarıya ölçeklendiği için gerçek pan adımı bunun yarısıdır (2.5°).
+_KEYBOARD_STEP = 5
+# Ok tuşları ve WASD birlikte destekleniyor: operatörün eli hangi taraftaysa
+# oradan sürebilsin. Değerler (dx, dy) gösterge adımıdır; ekranda yukarı,
+# tilt göstergesinde artı yön kabul edildi.
+_KEYBOARD_BINDINGS = {
+    Qt.Key_Left:  (-1, 0),
+    Qt.Key_A:     (-1, 0),
+    Qt.Key_Right: (1, 0),
+    Qt.Key_D:     (1, 0),
+    Qt.Key_Up:    (0, 1),
+    Qt.Key_W:     (0, 1),
+    Qt.Key_Down:  (0, -1),
+    Qt.Key_S:     (0, -1),
+}
 
 
 class MainWindow(QMainWindow):
@@ -88,12 +110,28 @@ class MainWindow(QMainWindow):
         self._candidate = None
         self._last_target_info: tuple | None = None
         self._reported_track_ids: set[int] = set()
+        # STM32'nin "ateşlendi" bayrağı periyodik telemetride seviye olarak
+        # gelir (her 200 ms'de aynı bayrak). Kenar yakalamazsak tek ateşleme
+        # onlarca log satırı ve tekrar tekrar imha sayacı sıfırlaması üretir.
+        self._last_fired_flag = False
+        self._last_failsafe_flag = False
+        self._last_range_reason: str | None = None
+        # Klavye komutundan hemen sonra gelen telemetrinin göstergeyi geri
+        # zıplatmasını engellemek için son manuel komut zamanı.
+        self._last_manual_command_t = 0.0
 
         # UI oluştur
         self._setup_window()
         self._setup_ui()
         self._setup_status_bar()
         self._setup_connections()
+
+        # Klavye ile yönelim, odak hangi alt widget'ta olursa olsun çalışmalı;
+        # operatör az önce bir düğmeye tıkladıysa ok tuşları o düğmede
+        # kaybolmasın. Uygulama seviyesindeki süzgeç bunu sağlıyor.
+        app = QGuiApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         
         # Başlangıç log'u
         self._log_system_info()
@@ -304,6 +342,7 @@ class MainWindow(QMainWindow):
         self.control_panel.mode_changed.connect(self._on_mode_changed)
         self.control_panel.fire_command.connect(self._on_fire_command)
         self.control_panel.servo_command.connect(self._on_servo_command)
+        self.control_panel.pid_command.connect(self._on_pid_command)
         self.control_panel.system_start.connect(self._on_system_start)
         self.control_panel.system_stop.connect(self._on_system_stop)
         self.control_panel.system_reset.connect(self._on_system_reset) # SERVO KONTROLÜ BURADA
@@ -325,6 +364,10 @@ class MainWindow(QMainWindow):
                 "YOLO ağırlık dosyası bulunamadı. models/best.pt koyun veya "
                 "GOKHISAR_YOLO_WEIGHTS ortam değişkenini ayarlayın."
             )
+        self.log_panel.log_info(
+            "MANUEL kip yönelimi: ok tuşları veya WASD "
+            f"({_KEYBOARD_STEP}° adım, Shift ile ince ayar)"
+        )
         self.log_panel.log_info("GÖKHİSAR Yer Kontrol İstasyonu başlatıldı")
     
     # ==================== WORKER YÖNETİMİ ====================
@@ -435,8 +478,9 @@ class MainWindow(QMainWindow):
         self.log_panel.log_info(
             f"RPi komut kanalı başlatıldı ({settings.host}:{settings.port})"
         )
-        # Bağlantı kurulur kurulmaz RPi'nin modu arayüzle aynı olmalı.
-        self._rpi_worker.send_mode(self._current_mode != "MANUEL")
+        # Bağlantı kurulur kurulmaz RPi'nin kipi, aşaması ve PID katsayıları
+        # arayüzde görünenle aynı olmalı.
+        self._push_mode_to_rpi()
     
     def stop_tcp_worker(self):
         if self._rpi_worker:
@@ -493,6 +537,11 @@ class MainWindow(QMainWindow):
     def _on_system_start(self):
         self.log_panel.log_info("🟢 Sistem başlatıldı")
         self.status_bar.showMessage("Sistem aktif")
+        # Önceki oturumda güvenli duruşa düşülmüş olabilir; yeniden başlatmada
+        # emniyet kilidi kalkar, ateş kilidi ise kapalı hâlde başlar.
+        self.control_panel.set_emergency(False)
+        self._last_fired_flag = False
+        self._last_failsafe_flag = False
         state = self._system.on_start()
         self.status_panel.set_system_state(state.value)
         self.start_udp_worker()
@@ -523,6 +572,11 @@ class MainWindow(QMainWindow):
         self._engaged_track_id = None
         self._candidate = None
         self._reported_track_ids.clear()
+        self.control_panel.set_emergency(False)
+        self.status_panel.set_critical_zone_warning(False)
+        self._last_fired_flag = False
+        self._last_failsafe_flag = False
+        self._last_range_reason = None
 
     @Slot(str)
     def _on_mode_changed(self, mode: str):
@@ -531,13 +585,12 @@ class MainWindow(QMainWindow):
         self.log_panel.log_info(f"Mod değiştirildi: {mode}")
         self.status_bar.showMessage(f"Aktif Mod: {mode}")
 
-        autonomous = mode != "MANUEL"
         if self._rpi_worker:
             # Mod değişiminde bekleyen komutları atıyoruz: manuel modda
             # üretilmiş bir hedef komutunun otonoma geçince uygulanması
             # (ya da tersi) beklenmedik servo hareketi üretir.
             self._rpi_worker.clear_pending()
-            self._rpi_worker.send_mode(autonomous)
+            self._push_mode_to_rpi()
         if self._vision_worker:
             self._vision_worker.set_stage(self._stage_from_mode(mode))
 
@@ -553,12 +606,41 @@ class MainWindow(QMainWindow):
         """
         return 2 if mode.upper() == "ASAMA_2" else 3
 
+    @staticmethod
+    def _rpi_stage_from_mode(mode: str) -> int:
+        """Arayüz modunu RPi'nin yarışma aşamasına çevir.
+
+        IFF aşaması ile aynı şey değil: MANUEL kipte görüntü işleme en
+        muhafazakâr IFF kuralını (3) uygularken, atış kontrol tarafında görev
+        Aşama-1'dir — orada LiDAR menzil kapısı aranmaz, yönelim operatörün
+        klavye komutlarıyla yapılır. Bu ayrımı karıştırmak, manuel modda
+        ateşin LiDAR beklerken hiç çıkmaması demek olurdu.
+        """
+        m = mode.upper()
+        if m == "MANUEL":
+            return 1
+        return 2 if m == "ASAMA_2" else 3
+
+    def _push_mode_to_rpi(self) -> None:
+        """Kip + aşama bilgisini RPi'ye gönder ve PID katsayılarını tazele."""
+        if self._rpi_worker is None:
+            return
+        autonomous = self._current_mode != "MANUEL"
+        self._rpi_worker.send_mode(
+            autonomous, self._rpi_stage_from_mode(self._current_mode)
+        )
+        kp, ki, kd = self.control_panel.servo_control.get_pid()
+        self._rpi_worker.send_pid(kp, ki, kd)
+
     def _enter_fail_safe(self, reason: str):
         """Sistemi güvenli duruşa al: hedef akışı kesilir, ateş kilitlenir."""
         state = self._system.on_fail_safe(reason)
         self.status_panel.set_system_state(state.value)
         self.log_panel.log_error(f"GÜVENLİ DURUŞ: {reason}")
         self.status_bar.showMessage(f"GÜVENLİ DURUŞ: {reason}")
+        # KTR Bölüm 6: emniyet katmanları arayüzde de kapanmalı. Ateş kilidi
+        # açık kalmışsa kapatılır ve ATEŞ düğmesi pasifleşir.
+        self.control_panel.set_emergency(True)
         if self._rpi_worker:
             self._rpi_worker.clear_pending()
 
@@ -672,15 +754,18 @@ class MainWindow(QMainWindow):
     # ---------- Operatör komutları ----------
     @Slot()
     def _on_fire_command(self):
-        """Manuel ATEŞ düğmesi.
+        """Manuel ATEŞ düğmesi (iki adımlı güvenlik mekanizmasının ikinci adımı).
 
-        Bilinen kısıt: `rpi/main.py`'nin bugünkü hâlinde ateşleme yalnızca
-        otonom modda, hedef akışı sürerken tamamlanıyor (`_check_engagement`
-        sadece "target" mesajında çağrılıyor). Manuel modda gönderilen
-        angajman talebi RPi'de kuyruğa alınır ama tetiklenmez. Operatörün
-        sessizce beklememesi için bu durum log'a yazılıyor.
+        Atış kontrol tarafı (`rpi5/fire_control`) `engage` mesajını ARM+FIRE
+        niyeti olarak yorumluyor; Aşama-1'de (manuel görev) ek bir kilit/menzil
+        koşulu aramadığı için manuel ateş artık RPi'de de tamamlanıyor. Bu
+        yüzden eskiden buraya yazılan "manuel modda ateş çıkmaz" uyarısı
+        kaldırıldı — yanlış bilgi vermek, hiç bilgi vermemekten kötüdür.
         """
         self.log_panel.log_warning("🔥 ATEŞ KOMUTU VERİLDİ!")
+        if self._system.state is SystemState.FAIL_SAFE:
+            self.log_panel.log_error("GÜVENLİ DURUŞ - ateş komutu reddedildi")
+            return
         if self._rpi_worker is None or not self._rpi_worker.isRunning():
             self.log_panel.log_error("RPi bağlantısı yok - Ateş komutu gönderilemedi!")
             return
@@ -696,19 +781,13 @@ class MainWindow(QMainWindow):
             return
 
         self._rpi_worker.send_engage(candidate.track_id, candidate.config_class_id)
-        if self._current_mode == "MANUEL":
-            self.log_panel.log_warning(
-                "Manuel modda ateşleme RPi tarafında tamamlanmıyor; "
-                "otonom moda geçilmeli"
-            )
 
     @Slot(int, int)
     def _on_servo_command(self, x: int, y: int):
-        """Kaydırıcı değerlerini RPi'nin açı uzayına çevirip gönder.
+        """Gösterge değerlerini RPi'nin açı uzayına çevirip gönder.
 
-        Kaydırıcılar mutlak açı verir, `PanTiltController.manual()` ise artım
-        bekler; dönüşümü RpiLinkWorker yapıyor. Burada yalnızca ölçek
-        uyumlaması var.
+        Göstergeler mutlak açı verir, RPi'nin `manual` mesajı ise artım bekler;
+        dönüşümü RpiLinkWorker yapıyor. Burada yalnızca ölçek uyumlaması var.
         """
         if self._rpi_worker is None or not self._rpi_worker.isRunning():
             return
@@ -716,18 +795,68 @@ class MainWindow(QMainWindow):
             return
         pan = _PAN_CENTER + x * _AZIMUTH_SCALE
         tilt = _TILT_CENTER + y
+        self._last_manual_command_t = time.monotonic()
         self._rpi_worker.set_manual_angles(pan, tilt)
+
+    @Slot(float, float, float)
+    def _on_pid_command(self, kp: float, ki: float, kd: float):
+        """Kontrol panelindeki P/I/D katsayılarını RPi denetleyicisine uygula.
+
+        KTR 4.3: "sistemin PID katsayıları operatöre görüntülenmekte olup ayrı
+        olarak ayarlanabilmektedir." Ayarın gerçekten bir etkisi olması için
+        değerin hat üzerinden RPi'ye gitmesi gerekiyor; yoksa kutular yalnızca
+        arayüzde duran süs olur.
+        """
+        if self._rpi_worker is None or not self._rpi_worker.isRunning():
+            self.log_panel.log_warning(
+                "RPi bağlantısı yok - PID katsayıları gönderilemedi"
+            )
+            return
+        self._rpi_worker.send_pid(kp, ki, kd)
+        self.log_panel.log_info(f"PID güncellendi: P={kp:.3f} I={ki:.3f} D={kd:.3f}")
+
+    # ---------- Klavye ile manuel yönelim (KTR 4.3.2) ----------
+    def _try_manual_keyboard(self, event) -> bool:
+        """Ok tuşları / WASD ile servo yönelimi. İşlendiyse True.
+
+        Üç kapı var: ana arayüz görünür olmalı, kip MANUEL olmalı ve odak bir
+        sayı giriş kutusunda olmamalı. Son kapı olmasa, operatör PID değerini
+        ok tuşlarıyla değiştirmek isterken tareti döndürürdü.
+        """
+        if self._stack.currentIndex() != 1:
+            return False
+        if self._current_mode != "MANUEL":
+            return False
+        if self._system.state is SystemState.FAIL_SAFE:
+            return False
+
+        delta = _KEYBOARD_BINDINGS.get(event.key())
+        if delta is None:
+            return False
+
+        focused = QApplication.focusWidget()
+        if isinstance(focused, QDoubleSpinBox):
+            return False
+
+        # Shift ile ince ayar: bir gösterge birimi (pan'de 0.5°).
+        step = 1 if event.modifiers() & Qt.ShiftModifier else _KEYBOARD_STEP
+        self.control_panel.servo_control.nudge(delta[0] * step, delta[1] * step)
+        return True
+
+    def eventFilter(self, watched, event):
+        """Alt widget odaklıyken de klavye yönelim komutlarını yakala."""
+        if event.type() == QEvent.Type.KeyPress and self._try_manual_keyboard(event):
+            return True
+        return super().eventFilter(watched, event)
 
     # ---------- RPi'den gelenler ----------
     @Slot(bool)
     def _on_rpi_connection(self, connected: bool):
         if connected:
             # Yeniden bağlanmada RPi'nin servo referansı merkeze döner;
-            # kaydırıcıları da merkeze alarak ekranla donanımı hizalıyoruz.
+            # göstergeleri de merkeze alarak ekranla donanımı hizalıyoruz.
             self.control_panel.servo_control.set_position(0, 0)
-            self._rpi_worker and self._rpi_worker.send_mode(
-                self._current_mode != "MANUEL"
-            )
+            self._push_mode_to_rpi()
         else:
             self.log_panel.log_warning("RPi bağlantısı yok")
 
@@ -735,34 +864,77 @@ class MainWindow(QMainWindow):
     def _on_telemetry(self, message: dict):
         """RPi telemetrisini panellere dağıt.
 
-        Beklenen alanlar ENTEGRASYON.md'de tanımlı. Bilinmeyen alanlar sessizce
-        yok sayılır ki RPi tarafı yeni alan eklediğinde arayüz kırılmasın.
+        Gelen satır önce `shared.protocol.normalize_telemetry()` ile kanonik
+        alanlara çevrilir. Sebep: gerçek atış kontrol servisi
+        (`rpi5/fire_control`) mesafeyi metre cinsinden `lidar_m`, açıları
+        `pan_deg/tilt_deg`, STM32 bayraklarını iç içe `stm` sözlüğünde
+        gönderiyor; sözleşmedeki eski `telemetry()` kurucusu ise santimetre ve
+        düz alanlar kullanıyor. Çeviriyi sözleşmede tek yerde tutmak, arayüzün
+        iki şemayı da bilmek zorunda kalmasını önlüyor.
         """
-        distance_cm = message.get("distance_cm")
-        if isinstance(distance_cm, (int, float)):
-            self.status_panel.set_target_distance(float(distance_cm) / 100.0)
+        data = protocol.normalize_telemetry(message)
 
-        if "in_forbidden_zone" in message:
-            self.status_panel.set_critical_zone_warning(
-                bool(message["in_forbidden_zone"])
-            )
+        distance_m = data.get("distance_m")
+        if distance_m is not None:
+            self.status_panel.set_target_distance(distance_m)
 
-        event = message.get("event")
-        if event == "fired":
-            track_id = message.get("track_id", self._engaged_track_id)
+        if "in_forbidden_zone" in data:
+            self.status_panel.set_critical_zone_warning(data["in_forbidden_zone"])
+
+        # Uygulanan açılar: göstergeleri ve artım referansını gerçeğe çek.
+        pan, tilt = data.get("pan"), data.get("tilt")
+        if pan is not None and tilt is not None:
+            self._sync_servo_indicators(pan, tilt)
+
+        # Ateşleme onayı: seviye bayrağının yükselen kenarı (KTR 4.2.2.8
+        # kapalı çevrim). Talep anı değil, STM32'nin gerçekten tetiklediği an.
+        fired = bool(data.get("fired", False))
+        if fired and not self._last_fired_flag:
+            track_id = data.get("track_id", self._engaged_track_id)
             self.log_panel.log_warning(f"Ateşleme onaylandı: #{track_id}")
             if self._vision_worker and track_id is not None:
-                # İmha değerlendirmesi (KTR 4.4.2) ancak ateşleme anını
-                # bilirse çalışabilir. RPi gerçek ateşleme anını bildirdiği
-                # için buradaki zaman damgası talep anındakinden daha
-                # doğrudur; sayaç yeniden başlar.
                 self._vision_worker.notify_fired(int(track_id))
-        elif event == "fail_safe":
-            self._enter_fail_safe(str(message.get("reason", "RPi güvenlik ihlali")))
+        self._last_fired_flag = fired
 
-        status = message.get("status")
-        if status:
-            self.status_bar.showMessage(f"Raspberry Pi: {status}")
+        failsafe = bool(data.get("failsafe", False))
+        if failsafe and not self._last_failsafe_flag:
+            reason = data.get("reason", "Atış kontrol birimi güvenli duruşta")
+            self._enter_fail_safe(str(reason))
+        self._last_failsafe_flag = failsafe
+
+        # Aşama-3 menzil kapısının gerekçesi operatöre yazılır: ateş çıkmadığında
+        # "neden çıkmadı" sorusunun cevabı log'da olsun.
+        reason = data.get("range_reason")
+        if isinstance(reason, str) and reason != self._last_range_reason:
+            self._last_range_reason = reason
+            if not data.get("range_ok", True):
+                self.log_panel.log_warning(f"Menzil kapısı: {reason}")
+
+        status_text = data.get("status_text")
+        if status_text:
+            self.status_bar.showMessage(f"Raspberry Pi: {status_text}")
+
+    def _sync_servo_indicators(self, pan: float, tilt: float) -> None:
+        """RPi'nin bildirdiği açıyı gösterge uzayına çevirip ekrana yaz.
+
+        KTR: göstergeler "sistemin anlık yatay ve düşey eksen açılarını"
+        gösterir. Otonom kipte açıyı PID belirlediği için, göstergenin gerçeği
+        yansıtmasının tek yolu telemetri. Artım referansı da aynı değere
+        çekilir; yoksa manuel kipe dönüldüğünde ilk komut sıçrama yapar.
+
+        Operatör az önce klavyeyle komut verdiyse yazma atlanır: telemetri
+        200 ms periyotlu, yani komut henüz uygulanmamışken gelen bir satır
+        göstergeyi geri zıplatır ve aynı artım ikinci kez gönderilebilir.
+        Girdi durduktan ~1 sn sonra gerçek yeniden söz sahibi olur — RPi açıyı
+        kenetlediyse gösterge de o kenetlenmiş değere oturur.
+        """
+        if time.monotonic() - self._last_manual_command_t < 1.0:
+            return
+        x = int(round((pan - _PAN_CENTER) / _AZIMUTH_SCALE))
+        y = int(round(tilt - _TILT_CENTER))
+        self.control_panel.servo_control.set_position(x, y)
+        if self._rpi_worker is not None:
+            self._rpi_worker.sync_angles(pan, tilt)
 
     @Slot(int)
     def _on_engagement_sent(self, track_id: int):
@@ -786,6 +958,11 @@ class MainWindow(QMainWindow):
     # ==================== PENCERE OLAYLARI ====================
     
     def closeEvent(self, event):
+        # Uygulama seviyesindeki klavye süzgeci pencereye bağlı; pencere
+        # kapanırken kaldırılmazsa silinmiş bir nesneye olay yönlenebilir.
+        app = QGuiApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         # Worker kapanış sırası: önce frame üretici (UDP), sonra tüketici
         # (Detection). Aksi sırada detection halen frame işlerken UDP
         # kapanırsa sorun olmaz ama tersine kapatmak en güvenlisi.
@@ -810,6 +987,8 @@ class MainWindow(QMainWindow):
             self._restart_connections()
         elif event.key() == Qt.Key_F6:
             self.toggle_target_simulator()
+        elif self._try_manual_keyboard(event):
+            event.accept()
         else:
             super().keyPressEvent(event)
     

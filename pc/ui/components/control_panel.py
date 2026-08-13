@@ -27,8 +27,11 @@ def _sec(text):
 
 def _pid_spin(val=0.0):
     sb = QDoubleSpinBox()
-    sb.setRange(0.0, 99.99); sb.setSingleStep(0.01)
-    sb.setValue(val); sb.setDecimals(2)
+    # RPi5 katsayıları binde birler mertebesinde (ör. I = 0.05); iki hane
+    # gösterimde 0.005 ile 0.014 aynı görünürdü. Üç hane ve 0.005 adım
+    # operatöre gerçekten ayar yapabileceği bir çözünürlük verir.
+    sb.setRange(0.0, 10.0); sb.setSingleStep(0.005)
+    sb.setValue(val); sb.setDecimals(3)
     sb.setFixedHeight(26)
     sb.setStyleSheet("""
         QDoubleSpinBox {
@@ -45,8 +48,33 @@ def _pid_spin(val=0.0):
 
 # ── Servo Widget ──────────────────────────────────────────────────────────────
 
+_AXIS_LABEL_ACTIVE = ("color:#c8cdd6;font-size:11px;font-weight:600;"
+                      "background:transparent;border:none;")
+_AXIS_LABEL_PASSIVE = ("color:#6b7280;font-size:11px;font-weight:600;"
+                       "background:transparent;border:none;")
+
+#: RPi5 atış kontrol servisinin açılıştaki PID katsayıları
+#: (`rpi5/fire_control/main.py` argümanları: --kp/--ki/--kd). Arayüz farklı bir
+#: değerle açılırsa operatör, göstergedeki sayının donanımdaki değer olduğunu
+#: sanır; bu yüzden varsayılanlar oradan kopyalanıyor.
+_DEFAULT_KP = 0.55
+_DEFAULT_KI = 0.05
+_DEFAULT_KD = 0.08
+
+
 class ServoControlWidget(QFrame):
+    """Eksen göstergeleri + ayarlanabilir PID katsayıları (KTR 4.3).
+
+    KTR: "Azimuth ve Elevation göstergeleri ... anlık açıları operatöre görsel
+    olarak sunmaktadır. Mevcut sürümde bu göstergeler yalnızca durum izleme
+    amacıyla kullanılmakta olup doğrudan komut girişine izin vermemektedir."
+    Bu yüzden kaydırıcılar fare/klavye ile sürüklenemez: yönelim komutu MANUEL
+    modda klavye ile, otonom modda PID ile üretilir; göstergeler yalnızca
+    sonucu yansıtır.
+    """
+
     servo_changed = Signal(int, int)
+    pid_changed = Signal(float, float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -58,13 +86,20 @@ class ServoControlWidget(QFrame):
         for attr, txt, lo, hi in [("x","Azimuth",-180,180),("y","Elevation",-90,90)]:
             row = QHBoxLayout(); row.setSpacing(4)
             lbl = QLabel(txt)
-            lbl.setStyleSheet("color:#c8cdd6;font-size:11px;font-weight:600;"
-                              "background:transparent;border:none;")
+            lbl.setStyleSheet(_AXIS_LABEL_ACTIVE)
             lbl.setFixedWidth(54)
             row.addWidget(lbl)
+            if attr == "x": self.x_label = lbl
+            else:           self.y_label = lbl
             sl = QSlider(Qt.Horizontal)
             sl.setRange(lo,hi); sl.setValue(0)
             sl.setStyleSheet(Styles.SLIDER)
+            # Gösterge: doğrudan komut girişi kapalı. `setEnabled(False)`
+            # kullanılmadı çünkü o kaydırıcıyı soluklaştırıp okunmaz hâle
+            # getiriyor; burada yalnızca kullanıcı girişi engelleniyor,
+            # programatik `setValue` çalışmaya devam ediyor.
+            sl.setFocusPolicy(Qt.NoFocus)
+            sl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             row.addWidget(sl, stretch=1)
             val = QLabel("0°")
             val.setStyleSheet("color:#00d4ff;font-size:11px;font-weight:700;"
@@ -80,7 +115,9 @@ class ServoControlWidget(QFrame):
 
         # PID — 3 sütun yan yana
         pid_row = QHBoxLayout(); pid_row.setSpacing(6)
-        for lbl_txt, attr, default in [("P","pid_p",1.0),("I","pid_i",0.0),("D","pid_d",0.1)]:
+        for lbl_txt, attr, default in [("P","pid_p",_DEFAULT_KP),
+                                       ("I","pid_i",_DEFAULT_KI),
+                                       ("D","pid_d",_DEFAULT_KD)]:
             col = QVBoxLayout(); col.setSpacing(1)
             l = QLabel(lbl_txt)
             l.setAlignment(Qt.AlignCenter)
@@ -89,6 +126,7 @@ class ServoControlWidget(QFrame):
             l.setFixedHeight(14)
             col.addWidget(l)
             sb = _pid_spin(default)
+            sb.valueChanged.connect(self._emit_pid)
             col.addWidget(sb)
             pid_row.addLayout(col)
             setattr(self, attr, sb)
@@ -98,6 +136,42 @@ class ServoControlWidget(QFrame):
     def reset_position(self): self.x_slider.setValue(0); self.y_slider.setValue(0)
     def get_position(self): return (self.x_slider.value(),self.y_slider.value())
     def get_pid(self): return (self.pid_p.value(),self.pid_i.value(),self.pid_d.value())
+
+    def _emit_pid(self, *_args):
+        self.pid_changed.emit(self.pid_p.value(), self.pid_i.value(), self.pid_d.value())
+
+    @Slot(float, float, float)
+    def set_pid(self, kp: float, ki: float, kd: float) -> None:
+        """Katsayıları dışarıdan yaz (RPi'nin bildirdiği değerle hizalamak için)."""
+        for spin, value in ((self.pid_p, kp), (self.pid_i, ki), (self.pid_d, kd)):
+            spin.blockSignals(True)
+            spin.setValue(float(value))
+            spin.blockSignals(False)
+
+    def set_manual_input_active(self, active: bool) -> None:
+        """Klavye ile yönelimin şu an mümkün olup olmadığını görsel olarak belirt.
+
+        Widget'ın tamamı `setEnabled(False)` ile kapatılmıyor: o, PID
+        kutularını da soluklaştırıp devre dışı bırakırdı — oysa KTR PID
+        ayarını kipten bağımsız olarak operatöre bırakıyor.
+        """
+        style = _AXIS_LABEL_ACTIVE if active else _AXIS_LABEL_PASSIVE
+        self.x_label.setStyleSheet(style)
+        self.y_label.setStyleSheet(style)
+
+    def nudge(self, dx: int, dy: int) -> None:
+        """Klavye adımı: göstergeleri sınırlar içinde kaydır.
+
+        Gösterge değeri değişince `servo_changed` yayılır ve komut RPi'ye
+        gider; yani klavye tek girdi yolu olsa da ekranla donanım aynı
+        değerde kalır.
+        """
+        self.x_slider.setValue(max(self.x_slider.minimum(),
+                                   min(self.x_slider.maximum(),
+                                       self.x_slider.value() + dx)))
+        self.y_slider.setValue(max(self.y_slider.minimum(),
+                                   min(self.y_slider.maximum(),
+                                       self.y_slider.value() + dy)))
 
     @Slot(int,int)
     def set_position(self,x,y):
@@ -112,6 +186,7 @@ class ControlPanel(QFrame):
     mode_changed  = Signal(str)
     fire_command  = Signal()
     servo_command = Signal(int,int)
+    pid_command   = Signal(float,float,float)
     system_start  = Signal()
     system_stop   = Signal()
     system_reset  = Signal()
@@ -230,12 +305,15 @@ class ControlPanel(QFrame):
         self.mode_group.buttonClicked.connect(self._on_mode_changed)
         self.otonom_sub_group.buttonClicked.connect(self._on_sub_mode_changed)
         self.servo_control.servo_changed.connect(lambda x,y: self.servo_command.emit(x,y))
+        self.servo_control.pid_changed.connect(
+            lambda p,i,d: self.pid_command.emit(p,i,d)
+        )
         self.btn_reset.clicked.connect(self.servo_control.reset_position)
         self.btn_unlock.toggled.connect(self._on_unlock_toggled)
         self.btn_fire.clicked.connect(self._on_fire_clicked)
 
-        # Başlangıçta servo aktif (Manuel mod)
-        self.servo_control.setEnabled(True)
+        # Başlangıçta MANUEL kip: klavye ile yönelim mümkün.
+        self.servo_control.set_manual_input_active(True)
 
     @property
     def is_fire_unlocked(self) -> bool:
@@ -262,14 +340,17 @@ class ControlPanel(QFrame):
         self.servo_control.reset_position()
         self.btn_manuel.setChecked(True)
         self.otonom_sub_widget.setVisible(False)
-        self.servo_control.setEnabled(True)
+        self.servo_control.set_manual_input_active(True)
+        self.set_emergency(False)
         self.system_reset.emit()
 
     # ── Mod ───────────────────────────────────────────────────────────
     def _on_mode_changed(self, button):
         is_otonom = self.mode_group.id(button) == 1
         self.otonom_sub_widget.setVisible(is_otonom)
-        self.servo_control.setEnabled(not is_otonom)
+        # KTR Bölüm 6: "Manuel dışı modlarda doğrudan girişleri pasifleştiren
+        # mod kilidi". Otonom kipte klavye ile yönelim kapanır.
+        self.servo_control.set_manual_input_active(not is_otonom)
         if is_otonom:
             # Hangi alt aşama seçili?
             sub_id = self.otonom_sub_group.checkedId()
@@ -285,6 +366,11 @@ class ControlPanel(QFrame):
 
     # ── Kilit / Ateş ──────────────────────────────────────────────────
     def _on_unlock_toggled(self, checked):
+        if checked and self._emergency_active:
+            # Güvenli duruşta kilit açılamaz; programatik bir setChecked
+            # gelse bile burada geri alınır.
+            self.btn_unlock.setChecked(False)
+            return
         self._fire_unlocked = checked
         if checked:
             self.btn_unlock.setText("KİLİT AÇIK ✓")
@@ -309,31 +395,57 @@ class ControlPanel(QFrame):
         if m == "MANUEL":
             self.btn_manuel.setChecked(True)
             self.otonom_sub_widget.setVisible(False)
-            self.servo_control.setEnabled(True)
+            self.servo_control.set_manual_input_active(True)
         elif m in ("ASAMA_2", "ASAMA_3"):
             self.btn_otonom.setChecked(True)
             self.otonom_sub_widget.setVisible(True)
-            self.servo_control.setEnabled(False)
+            self.servo_control.set_manual_input_active(False)
             if m == "ASAMA_2": self.btn_asama2.setChecked(True)
             else:               self.btn_asama3.setChecked(True)
+
+    @Slot(bool)
+    def set_emergency(self, active: bool) -> None:
+        """Güvenli duruş (FAIL_SAFE) kilidi.
+
+        KTR Bölüm 6 çok katmanlı emniyet istiyor; güvenli duruşta ateş yolunun
+        arayüzde de kapanması gerekiyor. Daha önce bu bayrak hiç kimse
+        tarafından açılmadığı için, açık kalmış bir ateş kilidi güvenli duruşta
+        da tıklanabilir kalıyordu.
+        """
+        self._emergency_active = bool(active)
+        if self._emergency_active:
+            self._fire_unlocked = False
+            self.btn_unlock.setChecked(False)
+            self.btn_unlock.setEnabled(False)
+        else:
+            self.btn_unlock.setEnabled(self._is_friendly_target is not True)
+        self.btn_fire.setEnabled(False)
+        self.btn_fire.setText(self._fire_idle_text())
+
+    def _fire_idle_text(self) -> str:
+        """ATEŞ düğmesinin boştaki etiketi: kilidin gerekçesini gösterir."""
+        if self._emergency_active:
+            return "⛔ GÜVENLİ DURUŞ"
+        if self._is_friendly_target is True:
+            return "🛡️ DOST HEDEF"
+        return "ATEŞ"
 
     @Slot(bool)
     def set_friendly_target(self, friendly):
         self._is_friendly_target = friendly
         if friendly:
             self.btn_fire.setEnabled(False)
-            self.btn_fire.setText("🛡️ DOST HEDEF")
             self.btn_unlock.setEnabled(False)
             self.btn_unlock.setChecked(False)
         else:
-            self.btn_fire.setText("ATEŞ")
             self.btn_unlock.setEnabled(not self._emergency_active)
             if self._fire_unlocked and not self._emergency_active:
                 self.btn_fire.setEnabled(True)
+        self.btn_fire.setText(self._fire_idle_text())
 
     @Slot()
     def clear_target_lock(self):
         self._is_friendly_target = None
-        self.btn_fire.setText("ATEŞ")
+        self.btn_fire.setText(self._fire_idle_text())
         if not self._emergency_active:
             self.btn_unlock.setEnabled(True)

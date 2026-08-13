@@ -16,3 +16,6 @@ pyserial>=3.5
 
 # Testing & Quality Assurance
 pytest>=7.4.0
+
+# KTR uygunluk PDF üretimi (tools/generate_ktr_pdf.py)
+reportlab>=4.0.0

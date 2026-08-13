@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """Donanımsız uçtan uca test için Raspberry Pi taklidi.
 
-`rpi/main.py`'nin ağ davranışını birebir taklit eder: 5005 portunu dinler,
-satır tabanlı JSON okur, `mode` / `manual` / `target` / `engage` mesajlarını
-aynı mantıkla işler. Farkı, gerçek `rpi/main.py`'nin yapmadığı bir şeyi de
-yapmasıdır: PC'ye telemetri geri yollar. Böylece arayüzün mesafe göstergesi,
-yasak bölge uyarısı ve ateşleme bildirimi yolları donanım olmadan test
-edilebilir.
+`rpi5/fire_control` paketinin **ağ davranışını** taklit eder: 5005 portunu
+dinler, satır tabanlı JSON okur, `mode` / `manual` / `target` / `engage` /
+`pid` mesajlarını aynı mantıkla işler ve 200 ms'de bir gerçeğiyle aynı alan
+adlarına sahip `status` telemetrisi yazar (`lidar_m`, `pan_deg`, `tilt_deg`,
+iç içe `stm` bayrakları).
 
-`rpi/` altındaki gerçek kod değiştirilmedi; bu dosya yalnızca bir test
-aracıdır ve `tools/` altında durur.
+Neden alan adları önemli: simülatör eskiden `distance_cm` gibi yalnızca
+kendisinde var olan alanlar gönderiyordu. Arayüz onunla çalışıyor, gerçek
+donanımla sessizce çalışmıyordu — yani simülatör "çalışıyor" hissi veren bir
+yanlıştı. Simülasyonun tek işi gerçeği temsil etmek.
+
+Tek bilinçli fark: `in_forbidden_zone`. Sözleşmede (`shared/engagement.py`)
+tanımlı, KTR Bölüm 6 tarafından isteniyor ama `rpi5/fire_control` henüz
+uygulamıyor. Arayüzdeki "KRİTİK BÖLGE" uyarı yolunun test edilebilir kalması
+için simülatör bunu hesaplayıp ek alan olarak gönderir.
+
+`pc/vision/` ve `rpi5/` altındaki kod değiştirilmedi; bu dosya yalnızca bir
+test aracıdır ve `tools/` altında durur.
 
 Çalıştırma:
     python tools/rpi_simulator.py
@@ -32,21 +41,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Güvenlik kuralları ve protokol sözleşmeden geliyor. Daha önce bunlar
-# `rpi/main.py`den içe aktarılıyordu; o yol `hardware_links` üzerinden pyserial'ı
-# da sürüklüyor ve içe aktarma başarısız olunca sessizce kopyalanmış
-# varsayılanlara düşülüyordu — yani simülatörün gerçeği temsil etmeyi bıraktığı
-# görünmez bir durum vardı. `shared` hem hafif hem tek doğru kaynak; RPi ile
-# aynı değerleri taşıdığını `tests/test_contract.py` doğruluyor.
+# Güvenlik kuralları ve protokol sözleşmeden geliyor; RPi ile aynı değerleri
+# taşıdığını `tests/test_contract.py` doğruluyor.
 from shared import engagement, geometry, protocol
 from shared.engagement import in_forbidden_zone
 
+#: `rpi5/fire_control/main.py` açılış katsayıları.
+_DEFAULT_GAINS = (0.55, 0.05, 0.08)
+_TELEMETRY_PERIOD_S = 0.2
+
 
 class SimulatedPanTilt:
-    """`PanTiltController`'ın basitleştirilmiş, PID'siz karşılığı.
+    """PID'siz, basitleştirilmiş yönelim.
 
     Simülatörün amacı PID'yi doğrulamak değil, protokolü doğrulamak. Gerçek
-    PID'yi taklit etmeye çalışmak yanıltıcı bir "çalışıyor" hissi verirdi.
+    PID'yi taklit etmeye çalışmak yanıltıcı bir "çalışıyor" hissi verirdi;
+    katsayılar yalnızca kaydedilir ve telemetride geri bildirilir.
     """
 
     def __init__(self, frame_w: int = geometry.FRAME_WIDTH,
@@ -54,6 +64,10 @@ class SimulatedPanTilt:
         self.cx, self.cy = frame_w / 2, frame_h / 2
         self.pan = engagement.SERVO_CENTER_ANGLE
         self.tilt = engagement.SERVO_CENTER_ANGLE
+        self.kp, self.ki, self.kd = _DEFAULT_GAINS
+
+    def set_gains(self, kp: float, ki: float, kd: float) -> None:
+        self.kp, self.ki, self.kd = float(kp), float(ki), float(kd)
 
     def step(self, target_x: float, target_y: float) -> tuple[float, float]:
         clamp = engagement.clamp_angle
@@ -75,8 +89,15 @@ class SimulatedRpi:
         self.distance_cm = distance_cm
         self.verbose = verbose
         self.autonomous = False
-        self.engage_request: dict | None = None
+        self.stage = 0
+        self.locked = False
+        self.class_id: int | None = None
+        self.track_id: int | None = None
+        self.engage_active = False
         self.in_range_since: float | None = None
+        # STM32'nin bir sonraki telemetride bildireceği "ateşlendi" bayrağı.
+        self._fired_pending = False
+        self._armed = False
         self._send_lock = threading.Lock()
         self._stop = threading.Event()
 
@@ -88,13 +109,46 @@ class SimulatedRpi:
 
     def _telemetry_loop(self) -> None:
         while not self._stop.is_set():
-            self.send(protocol.telemetry(
-                distance_cm=self.distance_cm,
-                in_forbidden_zone=in_forbidden_zone(self.ctrl.pan, self.ctrl.tilt),
-                pan=self.ctrl.pan,
-                tilt=self.ctrl.tilt,
-            ))
-            self._stop.wait(0.2)
+            self.send(self._status_payload())
+            self._stop.wait(_TELEMETRY_PERIOD_S)
+
+    def _status_payload(self) -> dict:
+        """`rpi5/fire_control/main.py`'nin yazdığı `status` satırının eşi."""
+        fired = self._fired_pending
+        self._fired_pending = False
+
+        range_ok, range_reason = True, "stage_lt_3"
+        if self.stage >= 3:
+            range_ok = engagement.is_safe_distance(
+                self.class_id if self.class_id is not None else -1,
+                self.distance_cm,
+            )
+            range_reason = "in_range" if range_ok else "out_of_range"
+
+        return {
+            "type": protocol.MessageType.STATUS,
+            "mode": "otonom" if self.autonomous else "manuel",
+            "stage": self.stage,
+            "class_id": -1 if self.class_id is None else self.class_id,
+            "pan_deg": round(self.ctrl.pan, 2),
+            "tilt_deg": round(self.ctrl.tilt, 2),
+            "locked": self.locked,
+            "engage_active": self.engage_active,
+            "lidar_m": round(self.distance_cm / 100.0, 3),
+            "range_ok": range_ok,
+            "range_reason": range_reason,
+            "pid": {"kp": self.ctrl.kp, "ki": self.ctrl.ki, "kd": self.ctrl.kd},
+            # Sözleşmede var, gerçek RPi5'te henüz yok — bkz. modül başlığı.
+            "in_forbidden_zone": in_forbidden_zone(self.ctrl.pan, self.ctrl.tilt),
+            "stm": {
+                "failsafe": False,
+                "armed": self._armed,
+                "fired": fired,
+                "busy": False,
+                "enabled": True,
+            },
+            "track_id": -1 if self.track_id is None else self.track_id,
+        }
 
     def send(self, payload: dict) -> None:
         line = protocol.encode_line(payload)
@@ -107,30 +161,52 @@ class SimulatedRpi:
     def stop(self) -> None:
         self._stop.set()
 
-    # ---------- mesaj işleme (rpi/main.py ile aynı mantık) ----------
+    # ---------- mesaj işleme (rpi5/fire_control/tcp_server.py mantığı) ----------
     def handle(self, msg: dict) -> None:
         mtype = msg.get("type")
 
         if mtype == protocol.MessageType.MODE:
             self.autonomous = bool(msg["autonomous"])
-            self.engage_request = None
-            self._log(f"mod: {'OTONOM' if self.autonomous else 'MANUEL'}")
-            self.send(protocol.status("OTONOM" if self.autonomous else "MANUEL"))
+            if "stage" in msg:
+                self.stage = int(msg["stage"])
+            elif self.autonomous and self.stage < 2:
+                self.stage = 2
+            self.engage_active = False
+            self._armed = False
+            self._log(f"mod: {'OTONOM' if self.autonomous else 'MANUEL'} "
+                      f"aşama={self.stage}")
 
-        elif mtype == protocol.MessageType.MANUAL and not self.autonomous:
+        elif mtype == protocol.MessageType.PID:
+            self.ctrl.set_gains(msg["kp"], msg["ki"], msg["kd"])
+            self._log(f"PID kp={self.ctrl.kp} ki={self.ctrl.ki} kd={self.ctrl.kd}")
+
+        elif mtype == protocol.MessageType.MANUAL:
             # dx/dy artımdır (protocol.MANUAL_IS_DELTA), mutlak açı değil.
+            if self.stage == 0:
+                self.stage = 1
             pan, tilt = self.ctrl.manual(msg["dx"], msg["dy"])
             self._command_angles(pan, tilt)
 
         elif mtype == protocol.MessageType.TARGET and self.autonomous:
+            self.class_id = msg.get("class_id", self.class_id)
+            self.track_id = msg.get("track_id", self.track_id)
+            self.locked = bool(msg.get("locked", self.locked))
             pan, tilt = self.ctrl.step(msg["cx"], msg["cy"])
             self._command_angles(pan, tilt)
-            self._check_engagement(msg.get("class_id"), msg.get("track_id"))
+            self._check_engagement()
 
         elif mtype == protocol.MessageType.ENGAGE:
-            self.engage_request = msg
+            self.engage_active = True
+            self._armed = True
+            self.class_id = msg.get("class_id", self.class_id)
+            self.track_id = msg.get("track_id", self.track_id)
             self.in_range_since = None
             self._log(f"angajman talebi: {msg}")
+            # Aşama-1 (manuel görev): menzil kapısı yok, ateş hemen çıkar.
+            if self.stage <= 1:
+                self._fire()
+            else:
+                self._check_engagement()
 
     def _command_angles(self, pan: float, tilt: float) -> None:
         if in_forbidden_zone(pan, tilt):
@@ -138,22 +214,29 @@ class SimulatedRpi:
             return
         self._log(f"servo pan={pan:.1f} tilt={tilt:.1f}")
 
-    def _check_engagement(self, class_id, track_id) -> None:
-        if self.engage_request is None or class_id is None:
+    def _check_engagement(self) -> None:
+        if not self.engage_active:
             return
-        if engagement.is_safe_distance(class_id, self.distance_cm):
+        if self.stage < 3:
+            self._fire()
+            return
+        if engagement.is_safe_distance(
+            self.class_id if self.class_id is not None else -1, self.distance_cm
+        ):
             if self.in_range_since is None:
                 self.in_range_since = time.monotonic()
             elif (time.monotonic() - self.in_range_since
                     >= engagement.ENGAGE_STABLE_SECONDS):
-                self._log(f"ATEŞ: class={class_id} dist={self.distance_cm:.0f}cm")
-                payload = protocol.event_fired(track_id)
-                payload.update(class_id=class_id, distance_cm=self.distance_cm)
-                self.send(payload)
-                self.engage_request = None
-                self.in_range_since = None
+                self._fire()
         else:
             self.in_range_since = None
+
+    def _fire(self) -> None:
+        self._log(f"ATEŞ: class={self.class_id} dist={self.distance_cm:.0f}cm")
+        self._fired_pending = True
+        self.engage_active = False
+        self._armed = False
+        self.in_range_since = None
 
     def _log(self, message: str) -> None:
         if self.verbose:

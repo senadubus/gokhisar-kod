@@ -25,14 +25,14 @@ from pc.integration import bootstrap  # noqa: E402  (yol kurulumundan sonra)
 
 bootstrap.install()
 
-# `pc/vision/tests/test_modules.py` içindeki PID testi RPi modülünü
-# `dirname(__file__)/../../rpi` diye göreli yoldan buluyor. Bu varsayım dosya
-# `pc/tests/` altındayken doğruydu; `pc/vision/tests/` altına taşınınca bir
-# dizin kaydı. Testi düzeltmek görüntü işleme dosyasına dokunmak olurdu, o
-# yüzden yolu buradan sağlıyoruz.
+# Not: `pc/vision/tests/test_modules.py::test_pid_converges_toward_center`
+# artık var olmayan `rpi/pid_controller.py`'yi içe aktarıyor. Atış kontrol
+# yazılımı `rpi5/fire_control/` olarak yeniden yazıldı ve PID'i orada, farklı
+# bir arayüzle duruyor (`pid.PID`). Eskiden bu dosyada `rpi/` dizinini sys.path'e
+# ekleyen bir yama vardı; dizin silindiği için yama ölü koda dönüştü ve
+# kaldırıldı.
 #
-# `insert` değil `append`: `rpi/main.py` ile kökteki `main.py` aynı modül adını
-# taşıyor, önek verirsek uygulamanın giriş noktası gölgelenirdi.
-_RPI_DIR = str(PROJECT_ROOT / "rpi")
-if _RPI_DIR not in sys.path:
-    sys.path.append(_RPI_DIR)
+# Test bilerek kırık bırakıldı: `pc/vision/` entegrasyon kapsamında
+# değiştirilmiyor ve sahte bir `pid_controller` modülü uydurmak, testi
+# "geçiyor" göstermek için gerçeği taklit etmek olurdu. Kırık test, görüntü
+# işleme ekibine düşen gerçek bir işi işaret ediyor.

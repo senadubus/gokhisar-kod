@@ -6,17 +6,20 @@ amacıyla JSON formatı" diyor; uygulama bunu birebir karşılıyor.
 
 İki yön farklı sahiplere ait
 ----------------------------
-**PC → RPi.** Kodlamayı `pc/vision/comms/rpi_link.py` içindeki `RpiLink`
-yapıyor ve `rpi/main.py` tam olarak onun ürettiğini bekliyor. Burada ikinci bir
-kodlayıcı yazmıyoruz — iki kodlayıcı iki ayrı gerçek demek olurdu. Bunun yerine
-şema **beyan ediliyor** ve `tests/test_contract.py` `RpiLink`'in gerçekten bu
-alanları ürettiğini doğruluyor.
+**PC → RPi.** Temel mesajların (target/engage/manual/mode) kodlayıcısı görüntü
+işleme reposundaki `pc/vision/comms/rpi_link.py` (`RpiLink`). Orası
+değiştirilmediği için arayüzün ihtiyaç duyduğu ek mesajlar (`pid`, `mode`
+içindeki `stage`) `pc/integration/rpi_channel.py` tarafından bu sözleşmeye göre
+üretilir. Şema burada **beyan ediliyor**, `tests/test_contract.py` iki tarafın
+da gerçekten bu alanları ürettiğini doğruluyor.
 
-**RPi → PC.** Bu yönün henüz bir uygulaması yok: `rpi/main.py` STM32 geri
-bildirimini ve LiDAR mesafesini yalnızca kendi konsoluna basıyor, PC'ye hiçbir
-şey göndermiyor. KTR 4.3 ise bu telemetriyi açıkça vaat ediyor. Sahipsiz olduğu
-için kodlayıcıyı `shared` üstleniyor: `tools/rpi_simulator.py` bugün bunu
-kullanıyor, RPi tarafı yazıldığı gün aynı fonksiyonları çağırması yeterli.
+**RPi → PC.** Karşı taraf artık `rpi5/fire_control/` paketi ve gerçekten
+telemetri gönderiyor: 200 ms'de bir `type="status"` satırı (LiDAR mesafesi,
+uygulanan pan/tilt, STM32 durum bayrakları). Ancak alan adları buradaki eski
+`telemetry()` kurucusundan farklı. İki şemayı arayüzde ayrı ayrı ele almak
+"hangi alan gerçek" sorusunu her panele taşırdı; bunun yerine
+`normalize_telemetry()` iki şemayı tek kanonik sözlüğe indirir ve arayüz
+yalnızca onu okur.
 """
 
 import json
@@ -26,7 +29,7 @@ from typing import Any
 # Portlar
 # ----------------------------------------------------------------------
 
-#: PC → RPi komut kanalı (TCP). `rpi/main.py` bu portu dinler.
+#: PC → RPi komut kanalı (TCP). `rpi5/fire_control/tcp_server.py` bu portu dinler.
 COMMAND_PORT: int = 5005
 
 #: RPi → PC video akışı (UDP, RTP/JPEG). GStreamer `udpsrc` bu portu dinler.
@@ -48,6 +51,9 @@ class MessageType:
     ENGAGE = "engage"
     MANUAL = "manual"
     MODE = "mode"
+    #: Operatörün YKİ'den ayarladığı PID katsayıları (KTR 4.3: "sistemin PID
+    #: katsayıları operatöre görüntülenmekte olup ayrı olarak ayarlanabilmektedir").
+    PID = "pid"
 
     # RPi → PC
     TELEMETRY = "telemetry"
@@ -73,12 +79,24 @@ REQUIRED_FIELDS: dict[str, frozenset[str]] = {
     MessageType.ENGAGE: frozenset({"track_id", "class_id"}),
     MessageType.MANUAL: frozenset({"dx", "dy"}),
     MessageType.MODE: frozenset({"autonomous"}),
+    MessageType.PID: frozenset({"kp", "ki", "kd"}),
 }
 
-#: Manuel yönelim komutu **mutlak açı değil artım** taşır: `rpi/main.py`
-#: gelen dx/dy'yi `PanTiltController.manual()`'a veriyor, o da mevcut açının
-#: üzerine ekliyor. Arayüz mutlak açı gösterdiği için `RpiLinkWorker` çevrimi
-#: yapar; bu not sözleşmenin en kolay yanlış anlaşılan maddesi.
+#: `mode` mesajındaki isteğe bağlı yarışma aşaması. `rpi5/fire_control` bu alanı
+#: okuyup Aşama-3 LiDAR menzil kapısını açıyor; alan gönderilmezse aşamayı
+#: kendi başına 1/2 olarak tahmin eder ve 3'e hiç çıkamaz. Arayüzdeki
+#: "2. AŞAMA / 3. AŞAMA" seçiminin donanımda karşılığı olması bu alana bağlı.
+MODE_OPTIONAL_FIELDS: frozenset[str] = frozenset({"stage"})
+
+#: Geçerli yarışma aşamaları. 1 = manuel görev, 2 = tüm hedefler düşman,
+#: 3 = renk tabanlı IFF + LiDAR menzil doğrulaması.
+STAGES: tuple[int, ...] = (1, 2, 3)
+
+#: Manuel yönelim komutu **mutlak açı değil artım** taşır:
+#: `rpi5/fire_control/tcp_server.py` gelen dx/dy'yi `manual_dpan/manual_dtilt`
+#: birikimine ekliyor, ana döngü de bunu mevcut açının üzerine uyguluyor.
+#: Arayüz mutlak açı gösterdiği için `RpiLinkWorker` çevrimi yapar; bu not
+#: sözleşmenin en kolay yanlış anlaşılan maddesi.
 MANUAL_IS_DELTA: bool = True
 
 
@@ -88,6 +106,32 @@ def missing_fields(payload: dict[str, Any]) -> frozenset[str]:
     if required is None:
         return frozenset()
     return required - payload.keys()
+
+
+# ----------------------------------------------------------------------
+# PC → RPi kurucuları (`RpiLink`'te karşılığı olmayan mesajlar)
+# ----------------------------------------------------------------------
+
+def pid(kp: float, ki: float, kd: float) -> dict[str, Any]:
+    """Operatörün ayarladığı PID katsayıları (pan ve tilt eksenine ortak).
+
+    `RpiLink` bu mesajı üretmiyor ve `pc/vision/` değiştirilmiyor; kodlayıcı
+    bu yüzden sözleşmede duruyor ve `RpiChannel` onu kullanıyor.
+    """
+    return {"type": MessageType.PID, "kp": float(kp), "ki": float(ki), "kd": float(kd)}
+
+
+def mode(autonomous: bool, stage: int | None = None) -> dict[str, Any]:
+    """Çalışma kipi (+ isteğe bağlı yarışma aşaması).
+
+    `RpiLink.send_mode()` yalnızca `autonomous` gönderiyor. Aşama bilgisi
+    olmadan RPi tarafındaki Aşama-3 kapıları hiç açılmadığı için arayüz bu
+    kurucuyu kullanır.
+    """
+    payload: dict[str, Any] = {"type": MessageType.MODE, "autonomous": bool(autonomous)}
+    if stage is not None:
+        payload["stage"] = int(stage)
+    return payload
 
 
 # ----------------------------------------------------------------------
@@ -163,3 +207,80 @@ def event_fail_safe(reason: str) -> dict[str, Any]:
 def status(text: str) -> dict[str, Any]:
     """Serbest metinli durum satırı; arayüzün durum çubuğunda gösterilir."""
     return {"type": MessageType.STATUS, "status": text}
+
+
+# ----------------------------------------------------------------------
+# RPi → PC telemetri normalleştirme
+# ----------------------------------------------------------------------
+
+#: `rpi5/fire_control/main.py`'nin periyodik `status` satırındaki alan adları
+#: yukarıdaki `telemetry()` kurucusundan farklı: mesafe metre cinsinden
+#: `lidar_m`, açılar `pan_deg`/`tilt_deg`, STM32 bayrakları `stm` sözlüğünde.
+#: Arayüzün iki şemayı ayrı ayrı bilmesi gerekmesin diye çeviri burada.
+def normalize_telemetry(payload: dict[str, Any]) -> dict[str, Any]:
+    """Gelen telemetriyi kanonik sözlüğe çevir.
+
+    Dönen sözlükte yalnızca **gerçekten gelen** alanlar bulunur; böylece
+    arayüz "alan yok" ile "alan sıfır" arasını ayırt edebilir. Desteklenen
+    girişler: `rpi5/fire_control` `status` satırı ve bu modüldeki
+    `telemetry()` / `event_*()` / `status()` kurucuları.
+
+    Kanonik alanlar: ``distance_m``, ``pan``, ``tilt``, ``in_forbidden_zone``,
+    ``fired``, ``failsafe``, ``armed``, ``enabled``, ``range_ok``,
+    ``range_reason``, ``track_id``, ``reason``, ``status_text``, ``mode``,
+    ``stage``.
+    """
+    out: dict[str, Any] = {}
+
+    def _num(value: Any) -> float | None:
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    # --- Mesafe: rpi5 metre, eski şema santimetre ---
+    lidar_m = _num(payload.get("lidar_m"))
+    if lidar_m is not None:
+        out["distance_m"] = lidar_m
+    else:
+        distance_cm = _num(payload.get("distance_cm"))
+        if distance_cm is not None:
+            out["distance_m"] = distance_cm / 100.0
+
+    # --- Uygulanan servo açıları ---
+    for canonical, keys in (("pan", ("pan_deg", "pan")), ("tilt", ("tilt_deg", "tilt"))):
+        for key in keys:
+            value = _num(payload.get(key))
+            if value is not None:
+                out[canonical] = value
+                break
+
+    if "in_forbidden_zone" in payload:
+        out["in_forbidden_zone"] = bool(payload["in_forbidden_zone"])
+
+    # --- STM32 durum bayrakları (rpi5: iç içe `stm` sözlüğü) ---
+    stm = payload.get("stm")
+    if isinstance(stm, dict):
+        for flag in ("fired", "armed", "failsafe", "enabled", "busy"):
+            if flag in stm:
+                out[flag] = bool(stm[flag])
+
+    # --- Eski şema: ayrık olay mesajları ---
+    event = payload.get("event")
+    if event == EventName.FIRED:
+        out["fired"] = True
+    elif event == EventName.FAIL_SAFE:
+        out["failsafe"] = True
+    if isinstance(payload.get("reason"), str):
+        out["reason"] = payload["reason"]
+    if isinstance(payload.get("range_reason"), str):
+        out["range_reason"] = payload["range_reason"]
+    if "range_ok" in payload:
+        out["range_ok"] = bool(payload["range_ok"])
+    if isinstance(payload.get("track_id"), int):
+        out["track_id"] = payload["track_id"]
+    if isinstance(payload.get("mode"), str):
+        out["mode"] = payload["mode"]
+    if isinstance(payload.get("stage"), int):
+        out["stage"] = payload["stage"]
+    if isinstance(payload.get("status"), str):
+        out["status_text"] = payload["status"]
+
+    return out

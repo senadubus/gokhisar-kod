@@ -23,7 +23,7 @@ git diff HEAD --stat -- 'pc/vision/' 'rpi/' 'stm32/'   # tüm satırlar 0 olmal�
 
 | # | Uyuşmazlık | Sonucu ne olurdu | Çözüm |
 |---|---|---|---|
-| 1 | Arayüz ikili (binary) TCP paketi gönderiyor, `rpi/main.py` satır tabanlı JSON okuyor | İki uç birbirini hiç anlamaz | `RpiChannel` + `RpiLinkWorker`, `pc/vision/comms/rpi_link.py`'yi kullanır |
+| 1 | Arayüz ikili (binary) TCP paketi gönderiyor, atış kontrol yazılımı satır tabanlı JSON okuyor | İki uç birbirini hiç anlamaz | `RpiChannel` + `RpiLinkWorker`, `pc/vision/comms/rpi_link.py`'yi kullanır |
 | 2 | Modelin sınıf sırası `pc/config.py` ile farklı | RPi yanlış güvenli mesafe tablosunu seçer | `ClassMap` |
 | 3 | `README`'de anlatılan `pc/vision/main.py` orkestratörü depoda yok | Modüller birbirine hiç bağlanmamış | `VisionPipeline` |
 | 4 | Arayüz mutlak servo açısı gönderiyor, `PanTiltController.manual()` artım bekliyor | Taret her komutta uçar | `RpiLinkWorker` mutlak→artım dönüşümü |
@@ -146,7 +146,7 @@ değişiklik olur.
                                                   RpiLinkWorker
                                                           │ TCP:5005 JSON
                                                           ▼
-                                                  rpi/main.py → STM32
+                                          rpi5/fire_control → STM32F411
 ```
 
 ---
@@ -156,50 +156,72 @@ değişiklik olur.
 Taşıma: TCP, satır sonu ile ayrılmış JSON. Sözleşme `shared/protocol.py`de
 beyan edilmiştir; iki yönün sahibi farklıdır.
 
-### 4.1 PC → RPi — kodlayıcı `pc/vision/comms/rpi_link.py`
+### 4.1 PC → RPi — kodlayıcı `pc/vision/comms/rpi_link.py` (+ `RpiChannel`)
 
-Bu yönü `RpiLink` kodluyor ve `rpi/main.py` tam olarak onun ürettiğini
-bekliyor. `shared/protocol.py` bu yön için **ikinci bir kodlayıcı yazmaz** —
+Temel mesajları (`target`, `engage`, `manual`, `mode`) `RpiLink` kodluyor ve
+`rpi5/fire_control/tcp_server.py` tam olarak onun ürettiğini bekliyor.
+`shared/protocol.py` bu mesajlar için **ikinci bir kodlayıcı yazmaz** —
 yazsaydı iki ayrı gerçek olurdu ve hangisinin doğru olduğu belirsizleşirdi.
 Onun yerine zorunlu alanları `REQUIRED_FIELDS` içinde beyan eder;
 `tests/test_contract.py::test_rpi_link_messages_satisfy_declared_schema`
-`RpiLink`'in gerçekten bu alanları ürettiğini, bir başka test de `rpi/main.py`nin
+`RpiLink`'in gerçekten bu alanları ürettiğini, bir başka test de RPi tarafının
 gönderdiğimiz her mesaj tipini gerçekten işlediğini doğrular.
+
+`RpiLink`'te karşılığı olmayan iki mesajın kodlayıcısı sözleşmededir
+(`protocol.pid()`, `protocol.mode(stage=...)`) ve gönderimi `RpiChannel`
+yapar. Sebep basit: `pc/vision/` değiştirilmiyor, ama KTR 4.3 PID ayarını ve
+Aşama-3 kapılarını istiyor.
 
 Satır tabanlı JSON, her mesaj `\n` ile biter.
 
 ```json
-{"type":"mode","autonomous":true}
+{"type":"mode","autonomous":true,"stage":3}
+{"type":"pid","kp":0.55,"ki":0.05,"kd":0.08}
 {"type":"manual","dx":-5.0,"dy":2.5}
 {"type":"target","t":1738000000.0,"cx":700.0,"cy":400.0,"class_id":2,"track_id":7,"locked":true}
 {"type":"engage","track_id":7,"class_id":2}
 ```
 
-`manual` **artım** taşır, mutlak açı değil. Arayüzün kaydırıcıları mutlak
+`manual` **artım** taşır, mutlak açı değil. Arayüzün eksen göstergeleri mutlak
 çalıştığı için dönüşümü `RpiLinkWorker` yapar:
 
 ```
-pan  = 90 + azimut_kaydırıcı / 2      (kaydırıcı ±180° → servo 0–180°)
-tilt = 90 + elevasyon_kaydırıcı       (kaydırıcı  ±90° → servo 0–180°)
+pan  = 90 + azimut_göstergesi / 2     (gösterge ±180° → servo 0–180°)
+tilt = 90 + elevasyon_göstergesi      (gösterge  ±90° → servo 0–180°)
 artım = yeni_mutlak − son_gönderilen_mutlak
 ```
 
-### 4.2 RPi → PC — kodlayıcı `shared/protocol.py`
+`stage` alanı olmadan RPi aşamayı kendisi 1/2 olarak tahmin eder ve 3'e hiç
+çıkmaz; yani arayüzdeki "3. AŞAMA" seçimi LiDAR menzil kapısını açamaz.
+`MANUEL → 1`, `2. AŞAMA → 2`, `3. AŞAMA → 3` eşlemesi
+`MainWindow._rpi_stage_from_mode()` içinde.
 
-`rpi/main.py`'nin bugünkü hâli PC'ye hiçbir şey göndermiyor; LiDAR mesafesini ve
-STM32 geri bildirimini yalnızca kendi konsoluna basıyor. KTR 4.3 ise bu
-telemetriyi açıkça vaat ediyor. Bu yönün bir sahibi olmadığı için kodlayıcıyı
-`shared` üstlendi (`telemetry()`, `event_fired()`, `event_fail_safe()`,
-`status()`). `tools/rpi_simulator.py` bugün bunları kullanıyor; RPi tarafı
-yazıldığı gün aynı fonksiyonları çağırması yeterli, PC'de hiçbir değişiklik
-gerekmez.
+### 4.2 RPi → PC — iki şema, tek okuyucu
+
+Atış kontrol servisi 200 ms'de bir `status` satırı yazıyor. Alan adları
+`shared/protocol.py`'deki eski `telemetry()` kurucusundan farklı: mesafe metre
+cinsinden `lidar_m`, açılar `pan_deg`/`tilt_deg`, STM32 bayrakları iç içe `stm`
+sözlüğünde. Arayüzün iki şemayı ayrı ayrı bilmesi gerekmesin diye çeviri tek
+noktada: `protocol.normalize_telemetry()`.
 
 ```json
-{"type":"telemetry","distance_cm":412.0,"pan":95.3,"tilt":88.1,"in_forbidden_zone":false}
-{"type":"event","event":"fired","track_id":7,"class_id":2,"distance_cm":412.0}
-{"type":"event","event":"fail_safe","reason":"STM32 yanıt vermiyor"}
-{"type":"status","status":"OTONOM"}
+{"type":"status","mode":"otonom","stage":3,"lidar_m":7.25,"pan_deg":96.4,
+ "tilt_deg":84.1,"locked":true,"range_ok":false,"range_reason":"out_of_range:iha:20.00 not in 0.0-15.0",
+ "pid":{"kp":0.55,"ki":0.05,"kd":0.08},
+ "stm":{"failsafe":false,"armed":true,"fired":false,"busy":false,"enabled":true}}
 ```
+
+Sözleşmenin kendi kurucuları (`telemetry()`, `event_fired()`,
+`event_fail_safe()`, `status()`) de aynı kanonik alanlara çevrilir; eski
+satırları yayan bir uç varsa arayüz onu da anlar.
+
+İki incelik:
+
+* `stm.fired` bir **seviye** bayrağıdır, olay değil. Arayüz yükselen kenarı
+  yakalar; yoksa tek ateşleme her telemetri turunda yeniden loglanır ve imha
+  sayacı sürekli sıfırlanır.
+* Ölçülemeyen alan hiç konmaz. `distance_m` yokluğu ile 0 karışırsa operatör
+  LiDAR arızasında "Mesafe: 0.0 m" görür — hedefi namluya değmiş sanır.
 
 Bilinmeyen alanlar sessizce yok sayılır; RPi yeni alan eklediğinde arayüz
 kırılmaz.
@@ -267,6 +289,33 @@ Mesafe ve yasak açı bölgesi denetimi PC'de tekrarlanmıyor: LiDAR verisi RPi'
 ve orada gecikmesiz. Aynı kontrolü iki yerde yapmak, iki yerin zamanla
 ayrışması riskini getirir.
 
+**Güvenli duruş (FAIL_SAFE).** Sisteme güvenli duruş geldiğinde ateş yolu
+arayüzde de kapanır: açık kalmış ateş kilidi kapatılır, "KİLİDİ AÇ" ve "ATEŞ"
+düğmeleri pasifleşir, ATEŞ düğmesi "GÜVENLİ DURUŞ" yazar. Sistem yeniden
+BAŞLAT ya da RESET ile sıfırlanana kadar bu kilit kalkmaz. Güvenli duruşa üç
+yoldan girilir: model yüklenemedi, boru hattı durum makinesi ihlali, ya da
+RPi telemetrisinde `stm.failsafe`.
+
+---
+
+## 6.1 Operatör girdileri (KTR 4.3 Şekil 4.11)
+
+| Girdi | Nereye gider | Not |
+|---|---|---|
+| Ok tuşları / WASD | `manual` (artım) | Yalnızca MANUEL kipte; Shift ince ayar |
+| P / I / D kutuları | `pid` | Kipten bağımsız, anında hatta çıkar |
+| MANUEL / OTONOM + Aşama | `mode` (+`stage`) | Aşama RPi'nin menzil kapısını belirler |
+| KİLİDİ AÇ → ATEŞ | `engage` | İki adımlı; dost hedefte ve güvenli duruşta kapalı |
+| SIFIRLA | `manual` (merkeze) | Göstergeler 0°/0° referansına döner |
+
+Azimuth ve Elevation **göstergedir**, komut girişi değil: KTR "bu göstergeler
+yalnızca durum izleme amacıyla kullanılmakta olup doğrudan komut girişine izin
+vermemektedir" diyor. Yönelim komutu MANUEL kipte klavyeden, otonom kipte
+PID'den gelir; göstergeler sonucu yansıtır. Değer iki kaynaktan güncellenir:
+klavye girdisi (anında) ve RPi telemetrisi (son klavye komutundan 1 sn sonra
+söz sahibi olur — böylece RPi açıyı kenetlediyse gösterge gerçeğe oturur ama
+tuşa basarken geri zıplamaz).
+
 ---
 
 ## 7. Kurulum ve çalıştırma
@@ -304,7 +353,7 @@ pytest            # 46 test: 6 görüntü işleme + 20 entegrasyon + 20 sözleş
 ```
 
 `tests/test_contract.py` özellikle önemli: `shared/` ile `pc/config.py`,
-`rpi/main.py`, `rpi/pid_controller.py` ve `stm32/main.c` değerlerinin hâlâ
+`rpi5/fire_control/` ve `stm32f411/Core/Inc/servo.h` değerlerinin hâlâ
 örtüştüğünü doğrular. Bu testlerden biri kırılırsa iki düğüm farklı şeye
 inanmaya başlamış demektir — kodu değil, hangi tarafın doğru olduğunu tartışın.
 
@@ -350,28 +399,28 @@ Hiçbir ayar için kod değiştirmeye gerek yok.
 
 ## 10. Bilinen boşluklar
 
-Bunların hepsi `rpi/` veya `pc/vision/` tarafında değişiklik gerektirdiği için,
-"görüntü işleme koduna dokunma" kuralı gereği yapılmadı.
+Bunların hepsi `pc/vision/`, `rpi5/` veya donanım tarafında değişiklik
+gerektiriyor; arayüz tarafındaki KTR boşlukları kapatıldı.
 
-1. **Manuel modda ateşleme RPi'de tamamlanmıyor.** `rpi/main.py`'de
-   `_check_engagement()` yalnızca `target` mesajı işlenirken çağrılıyor ve o dal
-   `self.autonomous` şartına bağlı. Manuel modda gönderilen `engage` talebi
-   kuyruğa alınır ama tetiklenmez. Arayüz bu durumu log'a yazıyor.
-   *Gereken:* `rpi/main.py`'de manuel angajman dalı.
-2. **RPi telemetri göndermiyor.** LiDAR mesafesi, yasak bölge durumu ve
-   ateşleme onayı şu an yalnızca RPi konsoluna yazılıyor. Arayüzdeki mesafe
-   göstergesi ve menzil bantları bu veri gelene kadar boş kalır.
-   *Gereken:* `rpi/main.py`'de bölüm 4.2'deki satırların soketten yazılması.
-3. **PID katsayı girişleri bağlı değil.** Kontrol panelindeki P/I/D alanları
-   okunuyor ama gönderilmiyor; protokolde karşılığı olan bir mesaj tipi yok.
-   *Gereken:* `rpi_link.py`'de `send_pid()` ve `rpi/main.py`'de karşılığı.
-4. **Balon sınıfı modelde yok.** Balon tespiti HSV'ye bağımlı; farklı ışıkta
+1. **Yasak sektör kapısı atış kontrol yazılımında yok.** KTR Bölüm 6 yasaklı
+   açılarda hem namlu hareketinin hem atış komutunun engellenmesini istiyor.
+   `rpi5/fire_control` yalnızca 0–180 kenetlemesi yapıyor; sektör kapısı hiç
+   yok. Sözleşmede tanım duruyor (`shared.engagement.FORBIDDEN_ZONES`), arayüz
+   uyarıyı gösterebiliyor, simülatör kapıyı uyguluyor — eksik olan gerçek uç.
+   `test_forbidden_zones_gate_exists_on_rpi` bu boşluğu **atlanan test** olarak
+   görünür tutuyor.
+   *Gereken:* `rpi5/fire_control/main.py`'de açı kapısı + `FLAG_FIRE` engeli.
+2. **Balon sınıfı modelde yok.** Balon tespiti HSV'ye bağımlı; farklı ışıkta
    `pc/config.py`'deki HSV eşikleri yeniden ayarlanmalı.
-5. **Servo aralığı 180°, KTR 4.1.1 ise yatay eksende 270° vaat ediyor.**
-   Hem `rpi/pid_controller.py` hem `stm32/main.c` iki ekseni de 0–180'e kırpıyor.
-   `shared/engagement.py` kodun gerçeğini yazıyor ve `test_servo_range_matches_stm32`
-   bunu kilitliyor. 270°'ye geçilecekse üçü birlikte değişmeli.
-6. **`DetectionWorker` artık ana yolda değil.** Silinmedi: model dosyası dışında
+3. **Servo aralığı 180°, KTR 4.1.1 ise yatay eksende 270° vaat ediyor.**
+   Hem `rpi5/fire_control` kenetlemesi hem `stm32f411`'in `SERVO_PAN_MAX_CDEG`'i
+   0–180 diyor. `shared/engagement.py` kodun gerçeğini yazıyor ve
+   `test_servo_range_matches_stm32` bunu kilitliyor. 270°'ye geçilecekse üçü
+   birlikte değişmeli.
+4. **`pc/performance_analysis/` bağlı değil.** `system_performance.py` yazıldı
+   ama hiçbir yerden çağrılmıyor, `object_performance.py` boş. KTR Bölüm 5'in
+   ölçüm vaatleri bu yüzden fiilen ölçülmüyor.
+5. **`DetectionWorker` artık ana yolda değil.** Silinmedi: model dosyası dışında
    hiçbir şeye ihtiyaç duymadan hızlı bir "sadece tespit" doğrulaması yapmaya
    yarıyor. Uygulamanın yolu artık `VisionWorker` + `RpiLinkWorker`.
    Buna karşılık ikili TCP protokolü kullanan `network_worker.py` **silindi**:
@@ -380,6 +429,6 @@ Bunların hepsi `rpi/` veya `pc/vision/` tarafında değişiklik gerektirdiği i
    şekilde `utils/paths.py` ve `utils/serial_port.py` de hiçbir yerden
    çağrılmadıkları ve artık var olmayan bir dizin düzenine atıf yaptıkları için
    kaldırıldı.
-7. **`README.md` eski ağacı anlatıyor.** Yukarı akışa ait olduğu için
+6. **`README.md` eski ağacı anlatıyor.** Yukarı akışa ait olduğu için
    değiştirilmedi; `pc/detection/` yazan yerleri `pc/vision/detection/` diye
    okuyun. Güncel ağaç bu belgenin 2. bölümünde.

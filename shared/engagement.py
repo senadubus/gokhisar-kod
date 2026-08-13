@@ -8,16 +8,22 @@ göstermek ve simülatörü gerçeğe sadık tutmak için kullanır.
 #: Servo açı aralığı (derece). Hem RPi'nin PID kenetlemesi hem STM32'nin
 #: darbe dönüşümü bu aralığı varsayar.
 #:
-#: KTR 4.1.1 yatay eksen için 270° vaat ediyor, ama `rpi/pid_controller.py` de
-#: `stm32/main.c`'deki `angle_to_pulse()` de iki ekseni 0-180'e kırpıyor.
-#: Sözleşme kodun gerçeğini yazar, raporun vaadini değil: 270°'ye geçilecekse
-#: burası, PID kenetlemesi ve STM32 darbe haritası birlikte değişmelidir.
+#: KTR 4.1.1 yatay eksen için 270° vaat ediyor, ama `rpi5/fire_control/main.py`
+#: içindeki `Limits` de `stm32f411`'in `SERVO_PAN_MAX_CDEG`'i de iki ekseni
+#: 0-180'e kırpıyor. Sözleşme kodun gerçeğini yazar, raporun vaadini değil:
+#: 270°'ye geçilecekse burası, RPi kenetlemesi ve STM32 darbe haritası
+#: birlikte değişmelidir.
 SERVO_MIN_ANGLE: float = 0.0
 SERVO_MAX_ANGLE: float = 180.0
 SERVO_CENTER_ANGLE: float = 90.0
 
 #: Yasaklı açı bölgeleri: (pan_min, pan_max, tilt_min, tilt_max).
-#: Bu bölgelere karşılık gelen komutlar STM32'ye hiç iletilmez.
+#: KTR Bölüm 6: bu bölgelerde hem namlu hareketi hem atış komutu engellenmeli.
+#:
+#: Uyarı: `rpi5/fire_control` bu kapıyı **henüz uygulamıyor** (yalnızca 0-180
+#: kenetlemesi var). Sözleşme tanımı burada duruyor çünkü arayüzün "KRİTİK
+#: BÖLGE" uyarısı ve simülatör bunu kullanıyor; atış kontrol tarafı kapıyı
+#: eklediğinde aynı değerleri okuması yeterli.
 FORBIDDEN_ZONES: tuple[tuple[float, float, float, float], ...] = (
     (0.0, 20.0, 0.0, 180.0),      # sol güvenlik bölgesi
     (160.0, 180.0, 0.0, 180.0),   # sağ güvenlik bölgesi
@@ -27,12 +33,17 @@ FORBIDDEN_ZONES: tuple[tuple[float, float, float, float], ...] = (
 #: Sınıf bazlı güvenli angajman mesafeleri, santimetre: class_id -> (min, max).
 #: KTR 4.2.2.7: "Her hedef sınıfı için sistemde önceden tanımlanmış güvenli
 #: angajman mesafeleri bulunmaktadır."
+#:
+#: Değerler `rpi5/fire_control/engagement.py`'deki `ENGAGE_RANGE_M` tablosunun
+#: santimetre karşılığıdır. Ayrıştıkları anda operatör "menzilde" görürken
+#: sistem ateş etmez (ya da tersi) — bu yüzden `tests/test_contract.py` iki
+#: tabloyu karşılaştırıyor. Balon bilinçli olarak yok: balon bir hedef değil,
+#: hedefin işaretidir ve atış kontrol onu `balon_not_engageable` ile reddeder.
 SAFE_ENGAGE_DISTANCES_CM: dict[int, tuple[int, int]] = {
-    0: (300, 1500),   # füze
-    1: (300, 1500),   # helikopter
-    2: (300, 1500),   # İHA
-    3: (300, 1500),   # savaş uçağı
-    4: (200, 1500),   # balon
+    0: (500, 1500),    # füze
+    1: (500, 1500),    # helikopter
+    2: (0, 1500),      # İHA
+    3: (1000, 1500),   # savaş uçağı
 }
 
 #: Hedefin güvenli mesafede kesintisiz kalması gereken süre (saniye).

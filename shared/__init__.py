@@ -8,9 +8,9 @@ bölgeleri.
 Neden ayrı bir paket?
 ---------------------
 Bu değerler daha önce her düğümde bağımsız birer sabit olarak duruyordu.
-En tehlikelisi kare geometrisiydi: ``pc/config.py`` 1280x720 diyordu,
-``rpi/pid_controller.py`` da ayrı bir literal olarak 1280x720 diyordu ve ikisi
-birbirini tanımıyordu. Kamera çözünürlüğü değişince PC koordinatları yeni
+En tehlikelisi kare geometrisiydi: ``pc/config.py`` 1280x720 diyordu, atış
+kontrol yazılımı da ayrı bir literal olarak (bugün ``--frame-w/--frame-h``
+varsayılanı) 1280x720 diyordu ve ikisi birbirini tanımıyordu. Kamera çözünürlüğü değişince PC koordinatları yeni
 uzayda üretmeye başlar, RPi ise hatayı hâlâ eski merkeze göre hesaplardı.
 Ortaya çıkan sabit nişan kaymasını PID **düzeltemez**, çünkü hata bir bozucu
 etki değil, referansın kendisindeki bir sapmadır. Sözleşmeyi tek yerde
@@ -26,8 +26,8 @@ onlar PC'ye özgüdür, RPi hiçbir zaman bir ``Detection`` görmez, yalnızca
 
 Görüntü işleme deposuyla ilişki
 -------------------------------
-``pc/config.py``, ``rpi/main.py`` ve ``rpi/pid_controller.py`` yukarı akış
-(senadubus) dosyalarıdır ve entegrasyon kapsamında değiştirilmemiştir; bu
+``pc/config.py``, ``rpi5/fire_control/`` ve ``stm32f411/`` yukarı akış
+dosyalarıdır ve entegrasyon kapsamında değiştirilmemiştir; bu
 yüzden şu an ``shared``'dan *okumuyorlar*, kendi literallerini taşımaya devam
 ediyorlar. Sözleşmenin tek gerçek kaynağı yine de burasıdır:
 ``tests/test_contract.py`` her iki tarafın buradaki değerlerle birebir aynı

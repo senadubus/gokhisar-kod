@@ -69,7 +69,7 @@ class NetworkConfig:
     Adres ve port değerleri artık burada tanımlanmıyor, `shared/protocol.py`den
     okunuyor: bunlar PC'ye özgü tercihler değil, RPi ile paylaşılan sözleşme
     maddeleri. Daha önce aynı port numarası hem burada hem `pc/config.py`de hem
-    `rpi/main.py`de bağımsız literaller olarak duruyordu.
+    atış kontrol yazılımında bağımsız literaller olarak duruyordu.
     """
 
     # Raspberry Pi bağlantı ayarları

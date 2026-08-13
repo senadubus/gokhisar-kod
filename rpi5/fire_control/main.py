@@ -92,6 +92,12 @@ def run(args: argparse.Namespace) -> None:
             if lidar:
                 lidar.poll()
 
+            gains = state.consume_pid_gains()
+            if gains is not None:
+                pid_x.set_gains(*gains)
+                pid_y.set_gains(*gains)
+                print(f"[PID] kp={gains[0]} ki={gains[1]} kd={gains[2]}")
+
             snap = state.snapshot()
             stage = int(snap.stage)
 
@@ -264,6 +270,13 @@ def run(args: argparse.Namespace) -> None:
                     "range_stable": range_stable,
                     "range_reason": range_reason,
                     "want_fire": want_fire,
+                    # YKİ'nin gösterdiği katsayıların gerçekten uygulandığını
+                    # operatör telemetriden doğrulayabilsin.
+                    "pid": {
+                        "kp": pid_x.gains.kp,
+                        "ki": pid_x.gains.ki,
+                        "kd": pid_x.gains.kd,
+                    },
                     "stm": None
                     if tel is None
                     else {

@@ -1,22 +1,21 @@
 """PC ↔ Raspberry Pi 5 komut/telemetri kanalı.
 
-Gönderim yönü görüntü işleme reposundaki `pc/vision/comms/rpi_link.py`
-(`RpiLink`) ile yapılır — protokolün tek doğru kaynağı odur ve `rpi/main.py`
-tam olarak onun ürettiği satır tabanlı JSON'u bekler. Burada o sınıf
-yeniden yazılmaz, sarmalanır.
+Temel mesajların (target/engage/manual/mode) gönderimi görüntü işleme
+reposundaki `pc/vision/comms/rpi_link.py` (`RpiLink`) ile yapılır; o dosya
+değiştirilmediği için burada yeniden yazılmaz, sarmalanır.
 
-`RpiLink` iki şeyi sunmaz, bu modül onları ekler:
+`RpiLink` üç şeyi sunmaz, bu modül onları ekler:
 
 1. **Bağlantı durumu.** `RpiLink` bağlantıyı ilk gönderimde tembel kurar;
    arayüzdeki "TCP Kontrol" LED'i için gönderim beklemeden bağlanmayı
    deneyebilmek gerekiyor.
 2. **Okuma yönü.** KTR 4.3'e göre LiDAR mesafesi ve ateşleme durumu RPi'den
-   PC'ye telemetri olarak dönmelidir; `RpiLink` yalnızca yazar.
-
-Not: `rpi/main.py`'nin bugünkü hâli PC'ye hiçbir şey göndermiyor (STM32
-geri bildirimini yalnızca kendi konsoluna basıyor). Okuma yolu yine de
-uygulandı; RPi tarafı telemetri satırlarını yazmaya başladığı gün arayüzde
-kod değişikliği gerekmeyecek. Beklenen satır biçimleri ENTEGRASYON.md'de.
+   PC'ye telemetri olarak dönmelidir; `RpiLink` yalnızca yazar. Karşı taraf
+   (`rpi5/fire_control`) 200 ms'de bir `status` satırı yazıyor.
+3. **Arayüzün ihtiyaç duyduğu ek komutlar.** KTR 4.3 PID katsayılarının
+   operatör tarafından ayarlanabilmesini, Aşama-3 kapılarının da açılmasını
+   istiyor; ikisi de `RpiLink`'te olmayan alanlar gerektiriyor. Bu mesajlar
+   `shared.protocol` kurucularıyla üretilir, böylece şema tek yerde kalır.
 """
 
 from __future__ import annotations
@@ -28,6 +27,7 @@ import threading
 
 from pc.integration import bootstrap  # noqa: F401  (sys.path kurulumu)
 from pc.integration.settings import RpiSettings
+from shared import protocol
 
 from comms.rpi_link import RpiLink
 
@@ -91,8 +91,32 @@ class RpiChannel:
         """Manuel yönelim: mutlak açı değil, **artım** gönderilir."""
         return self.link.send_manual(dx, dy)
 
-    def send_mode(self, autonomous: bool) -> bool:
-        return self.link.send_mode(autonomous)
+    def send_mode(self, autonomous: bool, stage: int | None = None) -> bool:
+        """Çalışma kipi ve yarışma aşaması.
+
+        Aşama gönderilmezse `RpiLink`'in kendi kodlayıcısı kullanılır. Aşama
+        varsa mesajı sözleşme kurucusu üretir: RPi tarafı `stage` alanını
+        görmezse Aşama-3 LiDAR menzil kapısını hiç açmıyor, yani arayüzdeki
+        "3. AŞAMA" seçiminin donanımda karşılığı olmuyor.
+        """
+        if stage is None:
+            return self.link.send_mode(autonomous)
+        return self._send(protocol.mode(autonomous, stage))
+
+    def send_pid(self, kp: float, ki: float, kd: float) -> bool:
+        """Operatörün ayarladığı PID katsayılarını RPi denetleyicisine uygula."""
+        return self._send(protocol.pid(kp, ki, kd))
+
+    def _send(self, payload: dict) -> bool:
+        """`RpiLink`'in gönderim yolunu ödünç al.
+
+        Sokete burada doğrudan yazmıyoruz: `RpiLink._send` kilidi, tembel
+        yeniden bağlanmayı ve hata durumunda soketi düşürmeyi hâlihazırda
+        yönetiyor. İkinci bir gönderim yolu açmak, iki farklı yeniden bağlanma
+        davranışı demek olurdu. `_connect()` ile birlikte `RpiLink` iç
+        detayına dokunduğumuz iki nokta bunlar; bilerek tek dosyada tutuldu.
+        """
+        return bool(self.link._send(payload))
 
     # ------------------------------------------------------------------
     # Telemetri okuma

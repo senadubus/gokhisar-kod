@@ -1,11 +1,11 @@
 """RpiLinkWorker — PC ↔ Raspberry Pi komut kanalını arka planda yürütür.
 
 Neden mevcut `TCPCommandWorker` kullanılmadı: o worker kendi ikili (binary)
-paket biçimini üretiyor, `rpi/main.py` ise satır tabanlı JSON okuyor. İki uç
-birbirini hiç anlamazdı. Protokolün tek doğru kaynağı görüntü işleme
-reposundaki `pc/vision/comms/rpi_link.py`; bu worker onu `RpiChannel` üzerinden
-kullanır. `TCPCommandWorker` yerinde bırakıldı ama artık uygulamanın
-yolunda değil.
+paket biçimini üretiyor, `rpi5/fire_control` ise satır tabanlı JSON okuyor
+(ikili çerçeve yalnızca RPi ile STM32 arasında kullanılıyor). İki uç birbirini
+hiç anlamazdı. Temel mesajların kodlayıcısı görüntü işleme reposundaki
+`pc/vision/comms/rpi_link.py`; bu worker onu `RpiChannel` üzerinden kullanır.
+`TCPCommandWorker` yerinde bırakıldı ama artık uygulamanın yolunda değil.
 
 Worker'ın çözdüğü dört problem:
 
@@ -16,8 +16,8 @@ Worker'ın çözdüğü dört problem:
    servo döngüsünün bundan faydası yok; sınırsız gönderim TCP tamponunu
    şişirip gecikme yaratır. Hedef mesajları `max_target_rate_hz` ile
    kısılır ve daima *en yeni* hedef gönderilir (latest-only).
-3. **Mutlak açı → artım dönüşümü.** Arayüzün kaydırıcıları mutlak açı verir,
-   `PanTiltController.manual()` ise artım bekler. Dönüşüm burada yapılır;
+3. **Mutlak açı → artım dönüşümü.** Arayüzün eksen göstergeleri mutlak açı
+   verir, RPi'nin `manual` mesajı ise artım bekler. Dönüşüm burada yapılır;
    böylece RPi kodu değişmez.
 4. **Ağ G/Ç'sinin UI thread'inden ayrılması.** `sendall` bloklayabilir;
    ana thread'de yapılırsa arayüz donar.
@@ -35,7 +35,7 @@ from pc.integration.rpi_channel import RpiChannel
 from pc.integration.settings import RpiSettings
 from pc.ui.workers.base_worker import BaseWorker
 
-# `PanTiltController` her iki eksende de 90°'den başlar; mutlak→artım
+# `rpi5/fire_control` her iki eksende de 90° (home) ile başlar; mutlak→artım
 # dönüşümünün başlangıç referansı bu olmalı.
 _SERVO_CENTER = 90.0
 _LOOP_POLL_S = 0.05
@@ -93,9 +93,28 @@ class RpiLinkWorker(BaseWorker):
         with QMutexLocker(self._mutex_out):
             self._manual_target = (float(pan), float(tilt))
 
-    def send_mode(self, autonomous: bool) -> None:
+    def send_mode(self, autonomous: bool, stage: int | None = None) -> None:
+        """Çalışma kipi (+ yarışma aşaması) komutu."""
         with QMutexLocker(self._mutex_out):
-            self._commands.append(("mode", bool(autonomous)))
+            self._commands.append(("mode", bool(autonomous), stage))
+
+    def send_pid(self, kp: float, ki: float, kd: float) -> None:
+        """Kontrol panelindeki P/I/D katsayılarını RPi'ye ilet (KTR 4.3)."""
+        with QMutexLocker(self._mutex_out):
+            self._commands.append(("pid", float(kp), float(ki), float(kd)))
+
+    def sync_angles(self, pan: float, tilt: float) -> None:
+        """Mutlak→artım dönüşümünün aynasını RPi'nin bildirdiği açıya çek.
+
+        Artım hesabı "arayüzün en son gönderdiği açı" referansına dayanıyor.
+        RPi otonom modda PID ile ya da yasak açı kenetlemesiyle farklı bir
+        açıda kalırsa, referans kaymış olur ve manuel moda dönüldüğünde ilk
+        komut yanlış yöne bir sıçrama üretir. Telemetri gerçeği söylediği için
+        aynayı ona göre düzeltiyoruz.
+        """
+        with QMutexLocker(self._mutex_out):
+            self._pan = float(pan)
+            self._tilt = float(tilt)
 
     def send_engage(self, track_id: int, class_id: int) -> None:
         """Angajman talebi. Mesafe/yasak bölge doğrulaması RPi'de yapılır."""
@@ -151,11 +170,12 @@ class RpiLinkWorker(BaseWorker):
         if not self._channel.connect():
             return False
 
-        # RPi süreci yeniden başlamış olabilir ve `PanTiltController` 90/90'da
-        # kurulur. Aynası da merkeze alınmazsa ilk manuel komut yanlış bir
+        # RPi süreci yeniden başlamış olabilir ve açılar 90/90 (home) kabul
+        # edilir. Aynası da merkeze alınmazsa ilk manuel komut yanlış bir
         # artım üretir.
-        self._pan = _SERVO_CENTER
-        self._tilt = _SERVO_CENTER
+        with QMutexLocker(self._mutex_out):
+            self._pan = _SERVO_CENTER
+            self._tilt = _SERVO_CENTER
         self._was_connected = True
         self.connection_changed.emit(True)
         self.emit_status(
@@ -172,8 +192,11 @@ class RpiLinkWorker(BaseWorker):
 
             kind = command[0]
             if kind == "mode":
-                if not self._channel.send_mode(command[1]):
+                if not self._channel.send_mode(command[1], command[2]):
                     self.emit_error("Mod komutu gönderilemedi")
+            elif kind == "pid":
+                if not self._channel.send_pid(command[1], command[2], command[3]):
+                    self.emit_error("PID katsayıları gönderilemedi")
             elif kind == "engage":
                 track_id, class_id = command[1], command[2]
                 if self._channel.send_engage(track_id, class_id):
@@ -185,16 +208,20 @@ class RpiLinkWorker(BaseWorker):
         with QMutexLocker(self._mutex_out):
             target = self._manual_target
             self._manual_target = None
+            # Referans açı `sync_angles()` ile UI thread'inden de yazılabildiği
+            # için okuma da kilit altında yapılır.
+            ref_pan, ref_tilt = self._pan, self._tilt
         if target is None:
             return
 
         pan, tilt = target
-        dx, dy = pan - self._pan, tilt - self._tilt
+        dx, dy = pan - ref_pan, tilt - ref_tilt
         # 0.05°'nin altındaki fark servoda karşılığı olmayan trafik üretir.
         if abs(dx) < 0.05 and abs(dy) < 0.05:
             return
         if self._channel.send_manual(dx, dy):
-            self._pan, self._tilt = pan, tilt
+            with QMutexLocker(self._mutex_out):
+                self._pan, self._tilt = pan, tilt
         else:
             self.emit_error("Manuel komut gönderilemedi")
 

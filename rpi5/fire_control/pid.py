@@ -25,6 +25,17 @@ class PID:
         self._prev_err = 0.0
         self._has_prev = False
 
+    def set_gains(self, kp: float, ki: float, kd: float) -> None:
+        """YKİ'den gelen katsayıları uygula (KTR 4.3: operatör ayarlayabilir).
+
+        İntegral terimi eski katsayıyla birikmiş olduğu için sıfırlanır; aksi
+        hâlde yeni Ki ile birlikte birikmiş hata bir sıçrama üretir.
+        """
+        self.gains.kp = float(kp)
+        self.gains.ki = float(ki)
+        self.gains.kd = float(kd)
+        self.reset()
+
     def step(self, error: float, dt: float) -> float:
         if dt <= 0.0:
             return 0.0

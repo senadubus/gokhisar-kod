@@ -41,6 +41,8 @@ class MissionState:
     estop: bool = False
     frame_w: int = 1280
     frame_h: int = 720
+    # gokhisar YKİ'den gelen PID katsayıları; ana döngü tüketince None olur.
+    pid_gains: Optional[tuple[float, float, float]] = None
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def snapshot(self) -> "MissionState":
@@ -75,6 +77,18 @@ class MissionState:
             self.manual_dpan = 0.0
             self.manual_dtilt = 0.0
             return dpan, dtilt
+
+    def consume_pid_gains(self) -> Optional[tuple[float, float, float]]:
+        """Bekleyen PID katsayılarını al; yoksa None.
+
+        Katsayıyı her döngüde yeniden uygulamak yerine tek seferlik tüketmek
+        gerekiyor: `PID.set_gains()` integrali sıfırlıyor, her turda çağrılsa
+        integral terimi hiç birikemezdi.
+        """
+        with self.lock:
+            gains = self.pid_gains
+            self.pid_gains = None
+            return gains
 
     def clear_engage(self) -> None:
         with self.lock:
@@ -162,6 +176,15 @@ class MissionState:
                 self.fire = bool(msg.get("fire", False))
                 if self.fire:
                     self.engage_active = True
+
+            elif t == "pid":
+                # gokhisar YKİ: {"type":"pid","kp":..,"ki":..,"kd":..}
+                try:
+                    self.pid_gains = (
+                        float(msg["kp"]), float(msg["ki"]), float(msg["kd"])
+                    )
+                except (KeyError, TypeError, ValueError):
+                    pass
 
             elif t == "servo":
                 if "pan_deg" in msg:
