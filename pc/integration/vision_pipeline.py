@@ -43,11 +43,10 @@ from detection.yolo_detector import Detection, YoloDetector
 from evaluation.prioritizer import TargetPrioritizer
 from iff.friend_foe import FriendFoeClassifier, IFFLabel
 from lifecycle.state_machine import TargetLifecycleManager, TargetState
-from tracking.tracker import ServoKalman, TargetTracker, TrackedTarget
+from tracking.tracker import (ServoKalman, TargetTracker, TrackedTarget,
+                              detections_same_object)
 from validation.matcher import TargetMatcher
 
-# Aynı nesnenin iki ayrı yoldan (tam kare + ROI) gelen kopyalarını eleme eşiği.
-_DEDUPE_IOU = 0.6
 # Doğrulanmış maketi takip kaydıyla eşlerken kabul edilen asgari örtüşme.
 _VALIDATION_IOU = 0.35
 # `TrackedTarget.servo_corrections` listesinin üst sınırı; önceliklendirme
@@ -396,8 +395,7 @@ class VisionPipeline:
         """
         kept: list[Detection] = []
         for det in sorted(detections, key=lambda d: d.conf, reverse=True):
-            if any(other.class_id == det.class_id and _iou(other, det) > _DEDUPE_IOU
-                   for other in kept):
+            if any(detections_same_object(other, det) for other in kept):
                 continue
             kept.append(det)
         return kept

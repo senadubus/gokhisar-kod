@@ -41,7 +41,10 @@ HUE_CYAN_RANGE = (80, 130)
 TRACK_HIGH_CONF = 0.5
 TRACK_LOW_CONF = 0.1
 TRACK_BUFFER = 30             # kayıp hedefin tutulacağı kare sayısı
-TRACK_MATCH_IOU = 0.8
+TRACK_MATCH_IOU = 0.55        # 0.8 çok katıydı; hızlı hareket/kutu kayması ID kopmasına yol açıyordu
+TRACK_DEDUPE_IOU = 0.30       # aktif takipler arası örtüşme birleştirme eşiği
+DEDUPE_IOU = 0.30             # tespit birleştirme; kaydırmalı çift kutular ~0.33 IoU verir
+DEDUPE_CENTER_RATIO = 1.1     # merkez mesafesi < max(kutu boyutu) * oran → aynı nesne
 
 # ---------------- Değerlendirme / Önceliklendirme (5 Ölçüt) ----------------
 W_SIZE = 0.35                  # hedef boyut ağırlığı
