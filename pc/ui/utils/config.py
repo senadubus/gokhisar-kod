@@ -101,7 +101,15 @@ class NetworkConfig:
     # bu sayede depay edilmiş JPEG kareleri subprocess.stdout üzerinden Python
     # tarafına akar. decodebin ve videoconvert'e ihtiyacımız yok çünkü Qt
     # tarafında QImage zaten JPEG decode edebiliyor (cv2.imdecode aracılığı ile).
-    GST_BIN = "gst-launch-1.0"
+    # Windows'ta VS Code/venv PATH'e GStreamer eklemeyebiliyor; bilinen yolu dene.
+    GST_BIN = (
+        r"C:\Program Files\gstreamer\1.0\msvc_x86_64\bin\gst-launch-1.0.exe"
+        if os.name == "nt"
+        and os.path.isfile(
+            r"C:\Program Files\gstreamer\1.0\msvc_x86_64\bin\gst-launch-1.0.exe"
+        )
+        else "gst-launch-1.0"
+    )
     GST_RTP_CAPS = (
         "application/x-rtp, media=video, encoding-name=JPEG, payload=26"
     )

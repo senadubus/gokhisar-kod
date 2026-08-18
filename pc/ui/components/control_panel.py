@@ -27,12 +27,13 @@ def _sec(text):
 
 def _pid_spin(val=0.0):
     sb = QDoubleSpinBox()
-    # RPi5 katsayıları binde birler mertebesinde (ör. I = 0.05); iki hane
-    # gösterimde 0.005 ile 0.014 aynı görünürdü. Üç hane ve 0.005 adım
-    # operatöre gerçekten ayar yapabileceği bir çözünürlük verir.
-    sb.setRange(0.0, 10.0); sb.setSingleStep(0.005)
-    sb.setValue(val); sb.setDecimals(3)
+    # Operatör ekrandan ayarlar; adım 0.002 (eski 0.005 çok kaba geliyordu)
+    sb.setRange(0.0, 10.0)
+    sb.setSingleStep(0.002)
+    sb.setValue(val)
+    sb.setDecimals(3)
     sb.setFixedHeight(26)
+    sb.setFocusPolicy(Qt.ClickFocus)  # WASD sürekli odak çalmasın
     sb.setStyleSheet("""
         QDoubleSpinBox {
             background:rgba(255,255,255,0.05); color:#00d4ff;
@@ -53,13 +54,10 @@ _AXIS_LABEL_ACTIVE = ("color:#c8cdd6;font-size:11px;font-weight:600;"
 _AXIS_LABEL_PASSIVE = ("color:#6b7280;font-size:11px;font-weight:600;"
                        "background:transparent;border:none;")
 
-#: RPi5 atış kontrol servisinin açılıştaki PID katsayıları
-#: (`rpi5/fire_control/main.py` argümanları: --kp/--ki/--kd). Arayüz farklı bir
-#: değerle açılırsa operatör, göstergedeki sayının donanımdaki değer olduğunu
-#: sanır; bu yüzden varsayılanlar oradan kopyalanıyor.
-_DEFAULT_KP = 0.55
-_DEFAULT_KI = 0.05
-_DEFAULT_KD = 0.08
+# PID varsayılanı 0 — kazançları yalnızca operatör ekrandan verir
+_DEFAULT_KP = 0.0
+_DEFAULT_KI = 0.0
+_DEFAULT_KD = 0.0
 
 
 class ServoControlWidget(QFrame):
@@ -92,7 +90,9 @@ class ServoControlWidget(QFrame):
             if attr == "x": self.x_label = lbl
             else:           self.y_label = lbl
             sl = QSlider(Qt.Horizontal)
-            sl.setRange(lo,hi); sl.setValue(0)
+            sl.setRange(lo, hi)
+            # Elevation home: -10°
+            sl.setValue(-10 if attr == "y" else 0)
             sl.setStyleSheet(Styles.SLIDER)
             # Gösterge: doğrudan komut girişi kapalı. `setEnabled(False)`
             # kullanılmadı çünkü o kaydırıcıyı soluklaştırıp okunmaz hâle

@@ -69,18 +69,23 @@ class TargetLifecycleManager:
             rec.lock_stable_frames = 0
 
     def update_lock(self, rec: TargetRecord, target: TrackedTarget) -> bool:
-        """Kilit sürdürme: merkez tolerans bölgesinde kararlıysa
-        angajmana hazır (True). Tolerans dışına çıkarsa TRACK'e döner."""
-        cx, cy = target.det.cx, target.det.cy
+        """Kilit: balon merkezi merkez bandında kalsın (kısa jitter sayacı silmesin)."""
+        ox = float(getattr(config, "AIM_OFFSET_X_PX", 0.0))
+        oy = float(getattr(config, "AIM_OFFSET_Y_PX", 0.0))
+        ax = target.det.cx + ox
+        ay = target.det.cy + oy
         fx, fy = config.FRAME_CENTER
-        err = math.hypot(cx - fx, cy - fy)
+        err = math.hypot(ax - fx, ay - fy)
 
-        if err <= config.LOCK_TOLERANCE_PX:
+        tol = float(config.LOCK_TOLERANCE_PX)
+        if err <= tol:
             rec.lock_stable_frames += 1
         else:
-            rec.lock_stable_frames = 0
-            if err > config.LOCK_TOLERANCE_PX * 3:
-                rec.state = TargetState.TRACK      # yeniden merkezleme
+            # Tek kare dışarı = sıfırlama (eski); jitter için 1 düşür
+            rec.lock_stable_frames = max(0, rec.lock_stable_frames - 1)
+            if err > tol * 4:
+                rec.state = TargetState.TRACK
+                rec.lock_stable_frames = 0
                 return False
         return rec.lock_stable_frames >= config.LOCK_STABLE_FRAMES
 

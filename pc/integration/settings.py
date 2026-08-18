@@ -27,7 +27,13 @@ import config as vision_config
 _HOST_PLACEHOLDER = "xxxx.xxxx.xxxx.xxxx"
 
 # Ağırlık dosyası için arama sırası. İlk bulunan kullanılır.
-_WEIGHT_CANDIDATES = ("best.pt", "yolo_modeli.pt", "yolov8s.pt")
+_WEIGHT_CANDIDATES = (
+    "balloon_best_052.pt",
+    "best.pt",
+    "balon.pt",
+    "yolo_modeli.pt",
+    "yolov8s.pt",
+)
 
 
 def _env(name: str, default: str) -> str:

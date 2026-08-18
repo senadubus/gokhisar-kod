@@ -112,12 +112,14 @@ class GStreamerVideoWorker(BaseWorker):
         ]
 
     def _ensure_gst_available(self) -> bool:
-        """gst-launch-1.0 PATH'te mi kontrol et."""
-        if shutil.which(self._gst_bin) is None:
+        """gst-launch-1.0 PATH'te veya mutlak yolda var mı."""
+        bin_path = self._gst_bin
+        ok = os.path.isfile(bin_path) if os.path.isabs(bin_path) else shutil.which(bin_path) is not None
+        if not ok:
             self.emit_error(
-                f"'{self._gst_bin}' bulunamadı. "
-                "GStreamer kurulu mu? (sudo apt install gstreamer1.0-tools "
-                "gstreamer1.0-plugins-good)"
+                f"'{bin_path}' bulunamadı. "
+                "GStreamer kurulu mu? Windows: "
+                r"C:\Program Files\gstreamer\1.0\msvc_x86_64\bin PATH'e eklenmeli."
             )
             return False
         return True
