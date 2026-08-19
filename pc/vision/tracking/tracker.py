@@ -152,6 +152,97 @@ class TrackKalman:
         return _as_float(s[2, 0]), _as_float(s[3, 0])
 
 
+class LightweightHistogramReID:
+    """Sıfır gecikmeli HSV Renk + Histogram Re-ID Parmak İzi."""
+
+    @staticmethod
+    def extract_feature(
+        frame: np.ndarray | None, bbox: tuple[float, float, float, float] | np.ndarray
+    ) -> np.ndarray | None:
+        if frame is None or frame.size == 0:
+            return None
+        h, w = frame.shape[:2]
+        b = np.asarray(bbox, dtype=np.float32).reshape(-1)
+        x1, y1, x2, y2 = (
+            int(max(0, b[0])),
+            int(max(0, b[1])),
+            int(min(w, b[2])),
+            int(min(h, b[3])),
+        )
+        if x2 - x1 < 6 or y2 - y1 < 6:
+            return None
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 4], [0, 180, 0, 256, 0, 256])
+        cv2.normalize(hist, hist)
+        return hist.flatten()
+
+    @staticmethod
+    def similarity(feat1: np.ndarray | None, feat2: np.ndarray | None) -> float:
+        if feat1 is None or feat2 is None:
+            return 0.0
+        dot = float(np.dot(feat1, feat2))
+        norm = float(np.linalg.norm(feat1) * np.linalg.norm(feat2)) + 1e-6
+        return float(dot / norm)
+
+
+class GlobalMotionCompensator:
+    """Arka plan hareketini (kamera pan/tilt sarsıntısı) hesaplayıp öteleyen sınıf."""
+
+    def __init__(self) -> None:
+        self.prev_gray: np.ndarray | None = None
+
+    def estimate_motion(
+        self, frame: np.ndarray | None, target_boxes: list[np.ndarray] | None = None
+    ) -> tuple[float, float]:
+        """Kareler arası (dx, dy) kamera kayma miktarını döndürür.
+        
+        Hareketli nesneler (target_boxes) maskelenerek optik akışın yalnızca
+        statik arka plandan kilit noktaları izlemesi garanti edilir.
+        """
+        if frame is None or frame.size == 0:
+            return 0.0, 0.0
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+        if self.prev_gray is None:
+            self.prev_gray = gray
+            return 0.0, 0.0
+
+        dx, dy = 0.0, 0.0
+        try:
+            mask = None
+            if target_boxes:
+                h, w = gray.shape[:2]
+                mask = np.full((h, w), 255, dtype=np.uint8)
+                for box in target_boxes:
+                    b = np.asarray(box, dtype=np.float32).reshape(-1)
+                    x1, y1, x2, y2 = int(max(0, b[0])), int(max(0, b[1])), int(min(w, b[2])), int(min(h, b[3]))
+                    mx1, my1 = max(0, x1 - 10), max(0, y1 - 10)
+                    mx2, my2 = min(w, x2 + 10), min(h, y2 + 10)
+                    mask[my1:my2, mx1:mx2] = 0
+
+            prev_pts = cv2.goodFeaturesToTrack(
+                self.prev_gray, maxCorners=120, qualityLevel=0.01, minDistance=25, mask=mask
+            )
+            if prev_pts is not None and len(prev_pts) >= 6:
+                curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                    self.prev_gray, gray, prev_pts, None
+                )
+                good_prev = prev_pts[status == 1]
+                good_curr = curr_pts[status == 1]
+                if len(good_prev) >= 6:
+                    M, _ = cv2.estimateAffinePartial2D(good_prev, good_curr)
+                    if M is not None:
+                        dx = float(M[0, 2])
+                        dy = float(M[1, 2])
+        except Exception:
+            pass
+
+        self.prev_gray = gray
+        return dx, dy
+
+
 @dataclass
 class TrackedTarget:
     track_id: int
@@ -161,6 +252,7 @@ class TrackedTarget:
     center_history: list = field(default_factory=list)
     servo_corrections: list = field(default_factory=list)
     predicted: bool = False      # bu karede kutu Kalman tahmini mi?
+    feature: np.ndarray | None = None  # Re-ID HSV özellik vektörü
 
 
 class TargetTracker:
@@ -170,10 +262,13 @@ class TargetTracker:
             minimum_matching_threshold=config.TRACK_MATCH_IOU,
             lost_track_buffer=config.TRACK_BUFFER,
             frame_rate=fps,
-            minimum_consecutive_frames=2,
+            minimum_consecutive_frames=1,
         )
         self.targets: dict[int, TrackedTarget] = {}
         self._kalmans: dict[int, TrackKalman] = {}
+        self.gmc = GlobalMotionCompensator()
+        self.reid = LightweightHistogramReID()
+        self.lost_pool: dict[int, TrackedTarget] = {}
 
     def set_fps(self, fps: int) -> None:
         """Ölçülen pipeline FPS → ByteTrack zaman adımı (Sena track update)."""
@@ -186,11 +281,16 @@ class TargetTracker:
         return self._kalmans[track_id]
 
     def _drop(self, track_id: int) -> None:
-        self.targets.pop(track_id, None)
+        t = self.targets.pop(track_id, None)
+        if t is not None and getattr(config, "ENABLE_REID", True) and t.feature is not None:
+            self.lost_pool[track_id] = t
+            if len(self.lost_pool) > 30:
+                oldest_id = next(iter(self.lost_pool))
+                self.lost_pool.pop(oldest_id, None)
         self._kalmans.pop(track_id, None)
 
-    def _coast_missing(self, tid: int) -> None:
-        """Ölçüm yok: Kalman predict + kutuyu ilerlet (hayalet donmasın)."""
+    def _coast_missing(self, tid: int, dx: float = 0.0, dy: float = 0.0) -> None:
+        """Ölçüm yok: Kalman predict + GMC ötelenmesi + kutuyu ilerlet (hayalet donmasın)."""
         t = self.targets[tid]
         t.misses += 1
         if t.misses > config.TRACK_BUFFER:
@@ -200,13 +300,35 @@ class TargetTracker:
         if not kf.initialized:
             return
         cx, cy = kf.predict_only()
-        # Güveni hafif düşür — tahmin olduğunu ayırt etmek için
+        cx += dx
+        cy += dy
         conf = max(0.05, t.det.conf * 0.92)
         t.det = _detection_at_center(t.det, cx, cy, conf=conf)
         t.predicted = True
         t.center_history.append((cx, cy))
         if len(t.center_history) > 60:
             t.center_history.pop(0)
+
+    def _try_reid_match(self, det: Detection, feat: np.ndarray | None) -> int | None:
+        """Kayıp iz havuzundan aynı görsel parmak izine sahip ID bulur."""
+        if feat is None or not getattr(config, "ENABLE_REID", True):
+            return None
+        best_id = None
+        best_sim = float(getattr(config, "REID_SIMILARITY_THRESHOLD", 0.65))
+        max_dist = float(getattr(config, "REID_MAX_DISTANCE_PX", 180.0))
+
+        for lost_id, lost_t in list(self.lost_pool.items()):
+            if lost_t.det.class_id != det.class_id:
+                continue
+            dist = math.hypot(lost_t.det.cx - det.cx, lost_t.det.cy - det.cy)
+            if dist > max_dist:
+                continue
+            sim = self.reid.similarity(feat, lost_t.feature)
+            if sim > best_sim:
+                best_sim = sim
+                best_id = lost_id
+
+        return best_id
 
     @staticmethod
     def _suppress_overlapping(tracked: sv.Detections) -> sv.Detections:
@@ -245,18 +367,30 @@ class TargetTracker:
             class_id=np.array([d.class_id for d in valid_dets]),
         )
 
-    def update(self, detections: list[Detection]) -> dict[int, TrackedTarget]:
-        """ByteTrack kimlik + TrackKalman konum (ölçüm / tahmin)."""
+    def update(
+        self, detections: list[Detection], frame: np.ndarray | None = None
+    ) -> dict[int, TrackedTarget]:
+        """ByteTrack kimlik + Re-ID + GMC + TrackKalman konum."""
+        dx, dy = 0.0, 0.0
+        if getattr(config, "ENABLE_GMC", True) and frame is not None:
+            active_boxes = [t.det.as_xyxy() for t in self.targets.values()]
+            dx, dy = self.gmc.estimate_motion(frame, target_boxes=active_boxes)
+            if abs(dx) > 0.3 or abs(dy) > 0.3:
+                for kf in self._kalmans.values():
+                    if kf.initialized:
+                        kf.kf.statePost[0, 0] += np.float32(dx)
+                        kf.kf.statePost[1, 0] += np.float32(dy)
+
         tracked = self.tracker.update_with_detections(self._to_sv(detections))
         if len(tracked) == 0 or tracked.tracker_id is None:
             for tid in list(self.targets):
-                self._coast_missing(tid)
+                self._coast_missing(tid, dx, dy)
             return self.targets
 
         tracked = self._suppress_overlapping(tracked)
         if len(tracked) == 0 or tracked.tracker_id is None:
             for tid in list(self.targets):
-                self._coast_missing(tid)
+                self._coast_missing(tid, dx, dy)
             return self.targets
 
         seen: set[int] = set()
@@ -267,7 +401,6 @@ class TargetTracker:
             tracked.tracker_id,
         ):
             tid = _as_int(tid)
-            seen.add(tid)
             x1, y1, x2, y2 = (float(v) for v in np.asarray(xyxy).reshape(-1)[:4])
             raw = Detection(
                 x1,
@@ -278,8 +411,18 @@ class TargetTracker:
                 class_id=_as_int(cls_id),
                 source="track",
             )
-            # KF'yi sadece miss coast için besle. Ölçüm varken ham merkez kullan —
-            # filtrelenmiş kutu gecikince taret önce geçer, sonra geri gelir (üst→alt→orta).
+            feat = self.reid.extract_feature(frame, (x1, y1, x2, y2))
+
+            # Yeni iz oluştuğunda kayıp havuzundan Re-ID kontrolü yap
+            if tid not in self.targets:
+                reid_matched_id = self._try_reid_match(raw, feat)
+                if reid_matched_id is not None:
+                    restored_t = self.lost_pool.pop(reid_matched_id)
+                    self._drop(tid)
+                    tid = reid_matched_id
+                    self.targets[tid] = restored_t
+
+            seen.add(tid)
             self._kf(tid).update(raw.cx, raw.cy)
             det = raw
             fx, fy = raw.cx, raw.cy
@@ -290,9 +433,17 @@ class TargetTracker:
                 t.age += 1
                 t.misses = 0
                 t.predicted = False
+                if feat is not None:
+                    if t.feature is None:
+                        t.feature = feat
+                    else:
+                        t.feature = 0.7 * t.feature + 0.3 * feat
             else:
-                t = TrackedTarget(track_id=tid, det=det, age=1, predicted=False)
+                t = TrackedTarget(
+                    track_id=tid, det=det, age=1, predicted=False, feature=feat
+                )
                 self.targets[tid] = t
+
             t.center_history.append((fx, fy))
             if len(t.center_history) > 60:
                 t.center_history.pop(0)
@@ -301,7 +452,6 @@ class TargetTracker:
             if tid in seen:
                 continue
             t = self.targets[tid]
-            # Çift iz: aktif ölçümlü örtüşen varsa düş
             if any(
                 other.det.class_id == t.det.class_id
                 and boxes_same_object(
@@ -314,7 +464,7 @@ class TargetTracker:
             ):
                 self._drop(tid)
                 continue
-            self._coast_missing(tid)
+            self._coast_missing(tid, dx, dy)
 
         return self.targets
 

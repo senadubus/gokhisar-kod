@@ -39,14 +39,20 @@ HUE_CYAN_RANGE = (80, 130)
 
 # ---------------- Takip ----------------
 # Sena main (track/performance update) + bizim Kalman/home/servo ayarları
-TRACK_HIGH_CONF = 0.35
+TRACK_HIGH_CONF = 0.20        # 0.35 -> 0.20: Düşük güvenli hızlı/uzak tespitlerin takibe girmesini sağlar
 TRACK_LOW_CONF = 0.1
-TRACK_BUFFER = 60             # ID sürekliliği (~0.7 sn @~60fps boru / ~2 sn @20fps)
-TRACK_MATCH_IOU = 0.35
-TRACK_DEDUPE_IOU = 0.30
+TRACK_BUFFER = 90             # 60 -> 90: Kaybolan hedef ID'sini daha uzun süre (3 sn @30fps) korur
+TRACK_MATCH_IOU = 0.15        # 0.35 -> 0.15: Hızlı harekette IoU çökmesine karşı esnek örtüşme kabul eder
+TRACK_DEDUPE_IOU = 0.55       # 0.30 -> 0.55: Canlı takipleri çakışma nedeniyle yanlışlıkla silmeyi önler
 DEDUPE_IOU = 0.30
 DEDUPE_CENTER_RATIO = 1.1
 TRACK_MAX_DRAW_MISSES = 2     # UI: 2 kareye kadar coast/tahmin çiz
+
+# Hafif Re-ID & Kamera Hareket Dengeleme (GMC)
+ENABLE_GMC = True             # Pan/Tilt kamera sarsıntısını piksel düzleminde telafi et
+ENABLE_REID = True            # HSV Renk Parmak İzi ile ID kurtarma (Re-Identification)
+REID_SIMILARITY_THRESHOLD = 0.65  # Benzerlik eşiği (0.0 - 1.0)
+REID_MAX_DISTANCE_PX = 180.0  # Maksimum kabul edilebilir merkez mesafesi (px)
 
 # Per-track + servo Kalman — ölçüme daha çok güven (lag/osalasyon azalsın)
 TRACK_KALMAN_PROCESS = 2e-2

@@ -257,7 +257,7 @@ class VisionPipeline:
                 validated, _unmatched = self.matcher.match(frame, models, balloons)
 
         with self.latency.measure("tracking"):
-            tracked = self.tracker.update(detections)
+            tracked = self.tracker.update(detections, frame=frame)
             self._accumulate_servo_corrections(tracked)
 
         validated_ids = self._link_validated_to_tracks(validated, tracked)
