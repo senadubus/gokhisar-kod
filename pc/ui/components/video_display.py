@@ -65,6 +65,11 @@ class VideoDisplay(QFrame):
         # gelir. Bu yüzden son hatayı hatırlayıp aynısı tekrarlanırsa
         # sessizce yutuyoruz; farklı bir hata gelirse yeniden raporlarız.
         self._last_error_msg: Optional[str] = None
+        # Süre göstergesi (EMA — titreşmesin)
+        self._ema_inf = 0.0
+        self._ema_total = 0.0
+        self._ema_queue = 0.0
+        self._latency_summary: Optional[dict] = None
         
         self._setup_ui()
     
@@ -152,6 +157,15 @@ class VideoDisplay(QFrame):
         """
         try:
             import cv2
+
+            if self._latency_summary:
+                try:
+                    from pc.integration.latency_tracker import LatencyTracker
+                    frame = LatencyTracker.draw_hud_from_summary(
+                        frame, self._latency_summary, show_details=True
+                    )
+                except Exception:
+                    pass
 
             # BGR -> RGB dönüşümü (Qt RGB bekler)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -424,12 +438,36 @@ class VideoDisplay(QFrame):
         # beklemeyi seçiyoruz; bir sonraki frame'de çizilir.
         # (30 fps'de bu en fazla 33 ms gecikme demektir.)
 
-        # Inference süresi varsa fps_label'a yaz (UX için faydalı)
+        # Süreler: Sena LatencyTracker özeti (PC tarafı)
         try:
-            inf_ms = float(getattr(detection_frame, "inference_ms", 0.0))
+            summary = getattr(detection_frame, "latency_summary", None) or {}
+            if summary:
+                self._latency_summary = dict(summary)
+            inf_ms = float(summary.get("yolo_detection", getattr(detection_frame, "inference_ms", 0.0)) or 0.0)
+            tot_ms = float(summary.get("total_pipeline", getattr(detection_frame, "total_ms", 0.0)) or 0.0)
+            q_ms = float(summary.get("queue_delay", getattr(detection_frame, "queue_ms", 0.0)) or 0.0)
+            e2e = float(summary.get("end_to_end", tot_ms) or 0.0)
             n = len(getattr(detection_frame, "detections", []) or [])
+            a = 0.25
+            self._ema_inf = (1 - a) * self._ema_inf + a * inf_ms if self._ema_inf else inf_ms
+            self._ema_total = (1 - a) * self._ema_total + a * tot_ms if self._ema_total else tot_ms
+            self._ema_queue = (1 - a) * self._ema_queue + a * q_ms if self._ema_queue else q_ms
+            fps = float(summary.get("fps", 0.0) or 0.0)
+            if fps <= 0 and self._ema_total > 1.0:
+                fps = 1000.0 / self._ema_total
+            bn = ""
+            if summary:
+                stages = ("yolo_detection", "hsv_detection", "matching", "tracking", "iff_classification", "comms")
+                best_k, best_v = "yolo_detection", -1.0
+                for k in stages:
+                    v = float(summary.get(k, 0.0) or 0.0)
+                    if v > best_v:
+                        best_k, best_v = k, v
+                bn = f" | BN:{best_k} {best_v:.0f}"
             self.fps_label.setText(
-                f"Inference: {inf_ms:.0f} ms | Tespit: {n}"
+                f"E2E {e2e:.0f} | YOLO {self._ema_inf:.0f} | "
+                f"Boru {self._ema_total:.0f} | Kuyruk {self._ema_queue:.0f} | "
+                f"~{fps:.0f} FPS | n={n}{bn}"
             )
         except Exception:
             pass

@@ -31,13 +31,16 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QMutex, QMutexLocker, Signal
 
+from pc.integration import bootstrap  # noqa: F401
 from pc.integration.rpi_channel import RpiChannel
 from pc.integration.settings import RpiSettings
 from pc.ui.workers.base_worker import BaseWorker
 
-# `rpi5/fire_control` her iki eksende de 90° (home) ile başlar; mutlak→artım
-# dönüşümünün başlangıç referansı bu olmalı.
-_SERVO_CENTER = 90.0
+import config
+
+# `rpi5/fire_control` pan home 90°, tilt home 80° (UI elevation -10).
+_SERVO_PAN_HOME = float(getattr(config, "SERVO_PAN_HOME_DEG", 90.0))
+_SERVO_TILT_HOME = float(getattr(config, "SERVO_TILT_HOME_DEG", 80.0))
 _LOOP_POLL_S = 0.05
 
 
@@ -72,9 +75,10 @@ class RpiLinkWorker(BaseWorker):
         self._pending_target: TargetCommand | None = None
         self._commands: deque = deque(maxlen=64)
         self._manual_target: tuple[float, float] | None = None
+        self._manual_deltas: list[tuple[float, float]] = []
 
-        self._pan = _SERVO_CENTER
-        self._tilt = _SERVO_CENTER
+        self._pan = _SERVO_PAN_HOME
+        self._tilt = _SERVO_TILT_HOME
         self._last_target_sent = 0.0
         self._last_connect_attempt = 0.0
         self._was_connected = False
@@ -92,6 +96,13 @@ class RpiLinkWorker(BaseWorker):
         """Kaydırıcıların mutlak açısı. Artıma dönüşümü worker yapar."""
         with QMutexLocker(self._mutex_out):
             self._manual_target = (float(pan), float(tilt))
+
+    def queue_manual_delta(self, dx: float, dy: float) -> None:
+        """Klavye: doğrudan artım (mutlak açı hesabı yok)."""
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return
+        with QMutexLocker(self._mutex_out):
+            self._manual_deltas.append((float(dx), float(dy)))
 
     def send_mode(self, autonomous: bool, stage: int | None = None) -> None:
         """Çalışma kipi (+ yarışma aşaması) komutu."""
@@ -126,6 +137,7 @@ class RpiLinkWorker(BaseWorker):
         with QMutexLocker(self._mutex_out):
             self._pending_target = None
             self._manual_target = None
+            self._manual_deltas.clear()
             self._commands.clear()
 
     # ------------------------------------------------------------------
@@ -170,12 +182,10 @@ class RpiLinkWorker(BaseWorker):
         if not self._channel.connect():
             return False
 
-        # RPi süreci yeniden başlamış olabilir ve açılar 90/90 (home) kabul
-        # edilir. Aynası da merkeze alınmazsa ilk manuel komut yanlış bir
-        # artım üretir.
+        # RPi home referansı: pan 90° / tilt 80° (UI elev -10).
         with QMutexLocker(self._mutex_out):
-            self._pan = _SERVO_CENTER
-            self._tilt = _SERVO_CENTER
+            self._pan = _SERVO_PAN_HOME
+            self._tilt = _SERVO_TILT_HOME
         self._was_connected = True
         self.connection_changed.emit(True)
         self.emit_status(
@@ -208,22 +218,28 @@ class RpiLinkWorker(BaseWorker):
         with QMutexLocker(self._mutex_out):
             target = self._manual_target
             self._manual_target = None
-            # Referans açı `sync_angles()` ile UI thread'inden de yazılabildiği
-            # için okuma da kilit altında yapılır.
+            deltas = list(self._manual_deltas)
+            self._manual_deltas.clear()
             ref_pan, ref_tilt = self._pan, self._tilt
-        if target is None:
-            return
 
-        pan, tilt = target
-        dx, dy = pan - ref_pan, tilt - ref_tilt
-        # 0.05°'nin altındaki fark servoda karşılığı olmayan trafik üretir.
-        if abs(dx) < 0.05 and abs(dy) < 0.05:
-            return
-        if self._channel.send_manual(dx, dy):
-            with QMutexLocker(self._mutex_out):
-                self._pan, self._tilt = pan, tilt
-        else:
-            self.emit_error("Manuel komut gönderilemedi")
+        if target is not None:
+            pan, tilt = target
+            dx, dy = pan - ref_pan, tilt - ref_tilt
+            if abs(dx) >= 0.05 or abs(dy) >= 0.05:
+                if self._channel.send_manual(dx, dy):
+                    ref_pan, ref_tilt = pan, tilt
+                else:
+                    self.emit_error("Manuel komut gönderilemedi")
+
+        for dx, dy in deltas:
+            if not self._channel.send_manual(dx, dy):
+                self.emit_error("Manuel komut gönderilemedi")
+            else:
+                ref_pan += dx
+                ref_tilt += dy
+
+        with QMutexLocker(self._mutex_out):
+            self._pan, self._tilt = ref_pan, ref_tilt
 
     def _push_target(self) -> None:
         with QMutexLocker(self._mutex_out):

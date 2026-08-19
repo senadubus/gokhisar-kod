@@ -57,7 +57,7 @@ _ALIASES: dict[str, int] = {
     "ucak": UCAK, "jet": UCAK, "plane": UCAK, "aircraft": UCAK,
     "savas ucagi": UCAK, "fighter": UCAK, "warplane": UCAK,
     # Balon
-    "balon": BALON, "balloon": BALON,
+    "balon": BALON, "balloon": BALON, "balloons": BALON,
 }
 
 # Model sınıf adına özel, operatöre gösterilecek ad. Burada olmayan adlar için

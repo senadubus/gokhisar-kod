@@ -34,6 +34,7 @@ import numpy as np
 
 from pc.integration import bootstrap  # noqa: F401  (sys.path kurulumu)
 from pc.integration.class_map import ClassMap
+from pc.integration.latency_tracker import LatencyTracker
 from pc.integration.settings import PipelineSettings
 from shared.classes import BALLOON_CLASS_ID, MODEL_CLASS_IDS
 
@@ -43,11 +44,10 @@ from detection.yolo_detector import Detection, YoloDetector
 from evaluation.prioritizer import TargetPrioritizer
 from iff.friend_foe import FriendFoeClassifier, IFFLabel
 from lifecycle.state_machine import TargetLifecycleManager, TargetState
-from tracking.tracker import ServoKalman, TargetTracker, TrackedTarget
+from tracking.tracker import (ServoKalman, TargetTracker, TrackedTarget,
+                              detections_same_object)
 from validation.matcher import TargetMatcher
 
-# Aynı nesnenin iki ayrı yoldan (tam kare + ROI) gelen kopyalarını eleme eşiği.
-_DEDUPE_IOU = 0.6
 # Doğrulanmış maketi takip kaydıyla eşlerken kabul edilen asgari örtüşme.
 _VALIDATION_IOU = 0.35
 # `TrackedTarget.servo_corrections` listesinin üst sınırı; önceliklendirme
@@ -84,6 +84,7 @@ class TrackView:
     is_candidate: bool
     locked: bool
     misses: int
+    predicted: bool = False  # True: bu karede kutu Kalman tahmini
 
 
 @dataclass
@@ -106,6 +107,7 @@ class PipelineResult:
     new_track_ids: list[int] = field(default_factory=list)
     lost_track_ids: list[int] = field(default_factory=list)
     destroyed_track_ids: list[int] = field(default_factory=list)
+    latency_summary: dict[str, float] = field(default_factory=dict)
 
 
 class _RemappedYolo(YoloDetector):
@@ -164,6 +166,7 @@ class VisionPipeline:
         self.prioritizer = TargetPrioritizer()
         self.lifecycle = TargetLifecycleManager()
         self.servo_kalman = ServoKalman()
+        self.latency = LatencyTracker()
 
         # Kare boyutu bilerek `shared`den değil `pc/config.py`den okunuyor:
         # normalizasyonun amacı, görüntü işleme modüllerinin *kendi* eşiklerinin
@@ -173,6 +176,7 @@ class VisionPipeline:
         self._frame_size = (vision_config.FRAME_WIDTH, vision_config.FRAME_HEIGHT)
         self._known_track_ids: set[int] = set()
         self._candidate_id: int | None = None
+        self._last_fps: int = 30
 
     # ------------------------------------------------------------------
     # Kurulum
@@ -227,14 +231,17 @@ class VisionPipeline:
         self.lifecycle = TargetLifecycleManager()
         self.servo_kalman = ServoKalman()
         self.hsv.reset_condition()
+        self.latency.reset()
         self._known_track_ids.clear()
         self._candidate_id = None
 
     # ------------------------------------------------------------------
     # Kare işleme
     # ------------------------------------------------------------------
-    def process(self, frame: np.ndarray) -> PipelineResult:
-        started = time.perf_counter()
+    def process(self, frame: np.ndarray, t_capture: float = 0.0) -> PipelineResult:
+        pipeline_start = time.perf_counter()
+        self.latency.record_queue_delay(t_capture)
+
         frame = self._normalize_frame(frame)
         height, width = frame.shape[:2]
 
@@ -246,18 +253,22 @@ class VisionPipeline:
 
         validated = []
         if self.matcher is not None:
-            validated, _unmatched = self.matcher.match(frame, models, balloons)
+            with self.latency.measure("matching"):
+                validated, _unmatched = self.matcher.match(frame, models, balloons)
 
-        tracked = self.tracker.update(detections)
-        self._accumulate_servo_corrections(tracked)
+        with self.latency.measure("tracking"):
+            tracked = self.tracker.update(detections)
+            self._accumulate_servo_corrections(tracked)
 
         validated_ids = self._link_validated_to_tracks(validated, tracked)
         for track_id in validated_ids:
             self.lifecycle.on_validated(track_id)
 
-        self._run_iff(frame, tracked)
+        with self.latency.measure("iff_classification"):
+            self._run_iff(frame, tracked)
 
-        candidate = self._select_candidate(tracked)
+        with self.latency.measure("prioritization"):
+            candidate = self._select_candidate(tracked)
         locked = self._update_lock(candidate)
         servo_target = self._update_servo_estimate(candidate)
 
@@ -268,6 +279,14 @@ class VisionPipeline:
         candidate_view = next(
             (v for v in views if candidate is not None
              and v.track_id == candidate.track_id), None)
+
+        self.latency.record_end_to_end(t_capture, pipeline_start)
+        total_ms = float(self.latency.stage_times.get("total_pipeline", 0.0))
+        if total_ms <= 0.0:
+            total_ms = (time.perf_counter() - pipeline_start) * 1000.0
+        if total_ms > 0:
+            self._last_fps = max(1, int(1000.0 / total_ms))
+            self.tracker.set_fps(self._last_fps)
 
         return PipelineResult(
             frame_width=width,
@@ -280,12 +299,13 @@ class VisionPipeline:
             balloon_count=len(balloons),
             validated_count=len(validated),
             inference_ms=inference_ms,
-            total_ms=(time.perf_counter() - started) * 1000.0,
+            total_ms=total_ms,
             stage=self.stage,
             backup_mode=self.backup_mode,
             new_track_ids=new_ids,
             lost_track_ids=lost_ids,
             destroyed_track_ids=destroyed,
+            latency_summary=self.latency.get_summary(),
         )
 
     # ------------------------------------------------------------------
@@ -312,41 +332,44 @@ class VisionPipeline:
 
     def _detect(self, frame: np.ndarray) -> tuple[list[Detection], float]:
         """Tespit adımı: YOLO tam kare + HSV + dinamik ROI iyileştirmesi."""
-        inference_start = time.perf_counter()
         yolo_dets: list[Detection] = []
-        if self.yolo is not None and not self.backup_mode:
-            yolo_dets = self._remap(self.yolo.detect(frame))
-        inference_ms = (time.perf_counter() - inference_start) * 1000.0
+        with self.latency.measure("yolo_detection"):
+            if self.yolo is not None and not self.backup_mode:
+                yolo_dets = self._remap(self.yolo.detect(frame))
+        inference_ms = float(self.latency.stage_times.get("yolo_detection", 0.0))
 
         hsv_dets: list[Detection] = []
-        if self.settings.hsv_assist or self.backup_mode:
-            if self.backup_mode:
-                hsv_dets = self.hsv.detect_backup(frame)
-            else:
-                models = [d for d in yolo_dets if d.class_id in MODEL_CLASS_IDS]
-                balloons = [d for d in yolo_dets if d.class_id == BALLOON_CLASS_ID]
-                triggered = self.hsv.update_condition(len(models), len(balloons), frame=frame)
-
-                if triggered:
-                    # Nesnesi tespit edilen ama altında balonu bulunamayan hedefleri bul
-                    unmatched_models = [
-                        m for m in models
-                        if not any(_iou(m, b) > 0.1 for b in balloons)
-                    ]
-                    for model in unmatched_models:
-                        # Nesnenin altına önce Model (YOLO), bulamazsa HSV çözümü uygula
-                        found = self.hsv.detect_under_object(frame, model, yolo_detector=self.yolo, remap_fn=self._remap)
-                        hsv_dets.extend(found)
-
-                    if not hsv_dets:
-                        hsv_dets = self.hsv.detect(frame, force=True)
-
         roi_dets: list[Detection] = []
-        if (self.yolo is not None and self.settings.roi_refine
-                and not self.backup_mode and hsv_dets):
-            for balloon in self._balloons_needing_refine(hsv_dets, yolo_dets):
-                roi = HsvBalloonDetector.dynamic_roi(balloon, frame.shape)
-                roi_dets.extend(self._remap(self.yolo.detect_in_roi(frame, roi)))
+        with self.latency.measure("hsv_detection"):
+            if self.settings.hsv_assist or self.backup_mode:
+                if self.backup_mode:
+                    hsv_dets = self.hsv.detect_backup(frame)
+                else:
+                    models = [d for d in yolo_dets if d.class_id in MODEL_CLASS_IDS]
+                    balloons = [d for d in yolo_dets if d.class_id == BALLOON_CLASS_ID]
+                    triggered = self.hsv.update_condition(len(models), len(balloons), frame=frame)
+
+                    if triggered:
+                        # Nesnesi tespit edilen ama altında balonu bulunamayan hedefleri bul
+                        unmatched_models = [
+                            m for m in models
+                            if not any(_iou(m, b) > 0.1 for b in balloons)
+                        ]
+                        for model in unmatched_models:
+                            # Nesnenin altına önce Model (YOLO), bulamazsa HSV çözümü uygula
+                            found = self.hsv.detect_under_object(frame, model, yolo_detector=self.yolo, remap_fn=self._remap)
+                            hsv_dets.extend(found)
+
+                        if not hsv_dets:
+                            hsv_dets = self.hsv.detect(frame, force=True)
+
+                # Düşük FPS'te ROI refine kareyi daha da yavaşlatır (Sena)
+                skip_roi_refine = self._last_fps < 20
+                if (self.yolo is not None and self.settings.roi_refine
+                        and not self.backup_mode and hsv_dets and not skip_roi_refine):
+                    for balloon in self._balloons_needing_refine(hsv_dets, yolo_dets):
+                        roi = HsvBalloonDetector.dynamic_roi(balloon, frame.shape)
+                        roi_dets.extend(self._remap(self.yolo.detect_in_roi(frame, roi)))
 
         return self._dedupe(yolo_dets + roi_dets + hsv_dets), inference_ms
 
@@ -396,8 +419,7 @@ class VisionPipeline:
         """
         kept: list[Detection] = []
         for det in sorted(detections, key=lambda d: d.conf, reverse=True):
-            if any(other.class_id == det.class_id and _iou(other, det) > _DEDUPE_IOU
-                   for other in kept):
+            if any(detections_same_object(other, det) for other in kept):
                 continue
             kept.append(det)
         return kept
@@ -450,9 +472,34 @@ class VisionPipeline:
             self.lifecycle.on_iff(track_id, label)
 
     def _select_candidate(self, tracked: dict[int, TrackedTarget]) -> TrackedTarget | None:
-        """Angajman adayını 5 ölçütlü öncelik puanıyla seç."""
+        """Angajman / takip adayını seç.
+
+        Balon-only modelde maket+IFF yok; balonlar doğrudan takip adayı olur
+        (servo merkeze götürsün). Ateş kararı ayrı kapılarda kalır.
+        """
+        # Test/KTR: kısa miss'te Kalman tahmini varken adayı hemen bırakma
+        max_miss = int(getattr(vision_config, "TRACK_CANDIDATE_MAX_MISSES", 5))
+        if getattr(vision_config, "TRACKING_TEST_MODE", False):
+            max_miss = max(max_miss, 8)
         candidates_input = []
         for track_id, target in tracked.items():
+            if target.det.class_id == BALLOON_CLASS_ID:
+                if target.misses > max_miss:
+                    continue
+                rec = self.lifecycle.get(track_id)
+                # Matcher/IFF balonu atladığı için yaşam döngüsünü burada ilerlet.
+                if rec.state is TargetState.DETECT:
+                    rec.state = TargetState.TRACK
+                if rec.state is TargetState.TRACK:
+                    rec.iff = IFFLabel.FOE
+                    rec.state = TargetState.EVALUATE
+                if rec.state in (TargetState.EVALUATE, TargetState.TARGET_LOCK):
+                    candidates_input.append((target, IFFLabel.FOE))
+                continue
+
+            # Kayıp maket izini kilit adayı yapma (Sena)
+            if target.misses > 0:
+                continue
             record = self.lifecycle.records.get(track_id)
             if record is None or record.iff is not IFFLabel.FOE:
                 continue
@@ -474,22 +521,22 @@ class VisionPipeline:
     def _update_servo_estimate(
         self, candidate: TrackedTarget | None
     ) -> tuple[float, float] | None:
-        """Servoya gidecek merkez koordinatını Kalman ile yumuşat.
+        """Servoya gidecek merkez — dt'li Kalman + lead (Sena).
 
-        Aday değiştiğinde filtre sıfırlanır; aksi hâlde eski hedefin hız
-        durumu yeni hedefe taşınır ve taret bir süre iki hedefin arasına nişan
-        alır.
+        TRACKING_TEST_MODE servo *gönderimini* UI'da keser; burada tahmin
+        üretilmeye devam eder (görsel doğrulama). Aday değişince reset.
         """
+        dt = 1.0 / max(1, self._last_fps)
         if candidate is None:
             self._candidate_id = None
             if self.servo_kalman.initialized:
-                return self.servo_kalman.predict_only()
+                return self.servo_kalman.predict_only(dt=dt)
             return None
 
         if candidate.track_id != self._candidate_id:
-            self.servo_kalman = ServoKalman()
+            self.servo_kalman.reset()
             self._candidate_id = candidate.track_id
-        return self.servo_kalman.update(candidate.det.cx, candidate.det.cy)
+        return self.servo_kalman.update(candidate.det.cx, candidate.det.cy, dt=dt)
 
     def _evaluate_destruction(self, tracked: dict[int, TrackedTarget]) -> list[int]:
         """Ateşlenmiş hedefler için üç koşullu imha doğrulaması (KTR 4.2.2.9).
@@ -538,7 +585,11 @@ class VisionPipeline:
     ) -> list[TrackView]:
         candidate_id = candidate.track_id if candidate else None
         views: list[TrackView] = []
+        max_misses = int(getattr(vision_config, "TRACK_MAX_DRAW_MISSES", 2))
         for track_id, target in tracked.items():
+            # Uzun miss hayaletlerini UI'dan çıkar (Sena: TRACK_MAX_DRAW_MISSES)
+            if target.misses > max_misses:
+                continue
             record = self.lifecycle.records.get(track_id)
             iff_label = record.iff if record else IFFLabel.UNKNOWN
             state = record.state.name if record else TargetState.DETECT.name
@@ -561,6 +612,7 @@ class VisionPipeline:
                 is_candidate=(track_id == candidate_id),
                 locked=(track_id == candidate_id and locked),
                 misses=target.misses,
+                predicted=bool(getattr(target, "predicted", False)),
             ))
         views.sort(key=lambda v: v.priority, reverse=True)
         return views

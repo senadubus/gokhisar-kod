@@ -86,6 +86,7 @@ class YoloDetector:
             crop,
             imgsz=config.YOLO_IMG_SIZE,
             conf=config.YOLO_CONF_THRESHOLD,
+            iou=config.YOLO_IOU_THRESHOLD,
             verbose=False,
         )[0]
 

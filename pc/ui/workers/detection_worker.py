@@ -97,6 +97,11 @@ class DetectionFrame:
     frame_width: int = 0
     frame_height: int = 0
     inference_ms: float = 0.0
+    # PC tarafı süreler (ms) — kamera/UDP uçtan uca lag değildir
+    total_ms: float = 0.0      # decode + YOLO + takip + IFF...
+    queue_ms: float = 0.0      # kare geldi → işlenmeye başlandı
+    fps: float = 0.0
+    latency_summary: dict = field(default_factory=dict)
 
 
 # ----------------------------------------------------------------------

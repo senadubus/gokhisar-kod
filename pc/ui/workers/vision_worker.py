@@ -34,6 +34,8 @@ from pc.ui.workers.base_worker import BaseWorker
 from pc.ui.workers.detection_worker import Detection, DetectionFrame
 from shared.classes import BALLOON_CLASS_ID
 
+import config
+
 # Kutu renkleri (RGB). IFF sonucu renkle taşınıyor: operatör etiketi okumadan,
 # çevresel görüşle bile dost/düşman ayrımını yapabilmeli.
 COLOR_FRIEND = (60, 220, 90)      # DOST — yeşil
@@ -65,6 +67,7 @@ class VisionWorker(BaseWorker):
         self._frame_mutex = QMutex()
         self._frame_cond = QWaitCondition()
         self._pending_frame: Optional[bytes] = None
+        self._pending_t: float = 0.0
 
         # Aşağıdaki istekler UI thread'inden gelir ama boru hattına yalnızca
         # worker thread'i dokunmalı. Bayrak olarak biriktirilip döngünün
@@ -82,6 +85,7 @@ class VisionWorker(BaseWorker):
     def submit_frame(self, jpeg_bytes: bytes) -> None:
         with QMutexLocker(self._frame_mutex):
             self._pending_frame = jpeg_bytes
+            self._pending_t = time.perf_counter()
         self._frame_cond.wakeAll()
 
     def set_stage(self, stage: int) -> None:
@@ -116,7 +120,8 @@ class VisionWorker(BaseWorker):
                 frame_bytes = self._pop_latest_frame()
                 if frame_bytes is None:
                     continue
-                self._process(frame_bytes)
+                jpeg_bytes, queued_at = frame_bytes
+                self._process(jpeg_bytes, queued_at)
         finally:
             self._pipeline = None
             self.emit_status("Görüntü işleme boru hattı durdu")
@@ -199,7 +204,7 @@ class VisionWorker(BaseWorker):
         for track_id in fired:
             self._pipeline.notify_fired(track_id)
 
-    def _pop_latest_frame(self) -> Optional[bytes]:
+    def _pop_latest_frame(self) -> Optional[tuple[bytes, float]]:
         self._frame_mutex.lock()
         try:
             while self._pending_frame is None and self.is_running:
@@ -207,32 +212,41 @@ class VisionWorker(BaseWorker):
                 # komutlar düzenli olarak kontrol edilebilsin.
                 self._frame_cond.wait(self._frame_mutex, 100)
             frame = self._pending_frame
+            queued_at = self._pending_t
             self._pending_frame = None
-            return frame
+            self._pending_t = 0.0
+            if frame is None:
+                return None
+            return frame, queued_at
         finally:
             self._frame_mutex.unlock()
 
     # ------------------------------------------------------------------
     # Kare işleme
     # ------------------------------------------------------------------
-    def _process(self, jpeg_bytes: bytes) -> None:
+    def _process(self, jpeg_bytes: bytes, queued_at: float = 0.0) -> None:
         try:
             import cv2
+
+            t0 = time.perf_counter()
+            queue_ms = max(0.0, (t0 - queued_at) * 1000.0) if queued_at > 0.0 else 0.0
 
             buffer = np.frombuffer(jpeg_bytes, dtype=np.uint8)
             frame = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
             if frame is None:
                 return
 
-            result = self._pipeline.process(frame)
-            self.detections_ready.emit(self._to_detection_frame(result))
+            result = self._pipeline.process(frame, t_capture=queued_at)
+            self.detections_ready.emit(
+                self._to_detection_frame(result, queue_ms=queue_ms)
+            )
             self.result_ready.emit(result)
         except Exception as exc:
             # Tek bir bozuk kare görevi düşürmemeli; hatayı bildir, devam et.
             self.emit_error(f"Boru hattı hatası: {type(exc).__name__}: {exc}")
             time.sleep(0.05)
 
-    def _to_detection_frame(self, result) -> DetectionFrame:
+    def _to_detection_frame(self, result, *, queue_ms: float = 0.0) -> DetectionFrame:
         """`PipelineResult`'ı mevcut çizim katmanının anladığı biçime çevir.
 
         Çizilenler: takip edilen her hedef (IFF rengiyle) ve takip altına
@@ -246,6 +260,9 @@ class VisionWorker(BaseWorker):
             is_balloon = view.config_class_id == BALLOON_CLASS_ID
             if view.locked:
                 color = COLOR_LOCKED
+            elif getattr(view, "predicted", False):
+                # Kalman tahmini — ölçüm yok, kutu ilerliyor
+                color = (180, 180, 220)
             elif is_balloon:
                 color = COLOR_BALLOON
             elif view.is_friendly is True:
@@ -260,6 +277,8 @@ class VisionWorker(BaseWorker):
                 label = f"{label} [KİLİT]"
             elif view.is_candidate:
                 label = f"{label} [ADAY]"
+            if getattr(view, "predicted", False):
+                label = f"{label} [TAHMİN]"
 
             drawables.append(Detection(
                 bbox_xyxy=view.bbox,
@@ -284,11 +303,20 @@ class VisionWorker(BaseWorker):
                 color=COLOR_BALLOON,
             ))
 
+        total_ms = float(getattr(result, "total_ms", 0.0) or 0.0)
+        fps = (1000.0 / total_ms) if total_ms > 1.0 else 0.0
+        summary = dict(getattr(result, "latency_summary", {}) or {})
+        if queue_ms > 0 and "queue_delay" not in summary:
+            summary["queue_delay"] = float(queue_ms)
         return DetectionFrame(
             detections=drawables,
             frame_width=result.frame_width,
             frame_height=result.frame_height,
             inference_ms=result.inference_ms,
+            total_ms=total_ms,
+            queue_ms=float(queue_ms),
+            fps=fps,
+            latency_summary=summary,
         )
 
     # ------------------------------------------------------------------
