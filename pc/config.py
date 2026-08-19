@@ -46,7 +46,7 @@ TRACK_MATCH_IOU = 0.15        # 0.35 -> 0.15: Hızlı harekette IoU çökmesine 
 TRACK_DEDUPE_IOU = 0.55       # 0.30 -> 0.55: Canlı takipleri çakışma nedeniyle yanlışlıkla silmeyi önler
 DEDUPE_IOU = 0.30
 DEDUPE_CENTER_RATIO = 1.1
-TRACK_MAX_DRAW_MISSES = 2     # UI: 2 kareye kadar coast/tahmin çiz
+TRACK_MAX_DRAW_MISSES = 2     # UI: Yalnızca canlı tespitleri çiz (kırpık/tahmini hayalet kutuları gösterme)
 
 # Hafif Re-ID & Kamera Hareket Dengeleme (GMC)
 ENABLE_GMC = True             # Pan/Tilt kamera sarsıntısını piksel düzleminde telafi et

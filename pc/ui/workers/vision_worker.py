@@ -260,9 +260,6 @@ class VisionWorker(BaseWorker):
             is_balloon = view.config_class_id == BALLOON_CLASS_ID
             if view.locked:
                 color = COLOR_LOCKED
-            elif getattr(view, "predicted", False):
-                # Kalman tahmini — ölçüm yok, kutu ilerliyor
-                color = (180, 180, 220)
             elif is_balloon:
                 color = COLOR_BALLOON
             elif view.is_friendly is True:
@@ -277,8 +274,7 @@ class VisionWorker(BaseWorker):
                 label = f"{label} [KİLİT]"
             elif view.is_candidate:
                 label = f"{label} [ADAY]"
-            if getattr(view, "predicted", False):
-                label = f"{label} [TAHMİN]"
+
 
             drawables.append(Detection(
                 bbox_xyxy=view.bbox,
