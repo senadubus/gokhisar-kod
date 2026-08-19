@@ -57,7 +57,7 @@ REID_MAX_DISTANCE_PX = 180.0  # Maksimum kabul edilebilir merkez mesafesi (px)
 # Per-track + servo Kalman — ölçüme daha çok güven (lag/osalasyon azalsın)
 TRACK_KALMAN_PROCESS = 2e-2
 TRACK_KALMAN_MEASURE = 3e-2
-TRACK_CANDIDATE_MAX_MISSES = 5
+TRACK_CANDIDATE_MAX_MISSES = 25  # ~0.83 sn (30 FPS) kilit/aday koruma toleransı
 # İleri bakış kapalı (tavana fırlatıyordu)
 SERVO_KALMAN_LEAD_S = 0.0
 SERVO_TARGET_MAX_JUMP_PX = 20.0

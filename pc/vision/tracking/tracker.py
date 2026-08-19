@@ -332,20 +332,16 @@ class TargetTracker:
 
         return best_id
 
-    def _suppress_overlapping(self, tracked: sv.Detections) -> sv.Detections:
-        """Aynı sınıfta yüksek örtüşen takiplerden yalnızca en güvenilir/aktif olanı bırak."""
+    @staticmethod
+    def _suppress_overlapping(tracked: sv.Detections) -> sv.Detections:
+        """Aynı sınıfta yüksek örtüşen takiplerden yalnızca en güvenilir olanı bırak."""
         n = len(tracked)
         if n <= 1:
             return tracked
 
-        def sort_key(i: int) -> float:
-            raw_tid = _as_int(tracked.tracker_id[i]) if tracked.tracker_id is not None else -1
-            can_id = self._id_map.get(raw_tid, raw_tid)
-            is_active = 1.0 if can_id in self.targets else 0.0
-            conf = _as_float(tracked.confidence[i])
-            return is_active * 2.0 + conf
-
-        order = sorted(range(n), key=sort_key, reverse=True)
+        order = sorted(
+            range(n), key=lambda i: _as_float(tracked.confidence[i]), reverse=True
+        )
         keep: list[int] = []
         for i in order:
             cls_i = _as_int(tracked.class_id[i])
@@ -419,32 +415,21 @@ class TargetTracker:
             )
             feat = self.reid.extract_feature(frame, (x1, y1, x2, y2))
 
-            # Kanonik ID belirleme (ID Mapping)
+            # Kanonik ID belirleme (Re-ID / ID Mapping)
             if raw_tid in self._id_map:
                 tid = self._id_map[raw_tid]
+            elif raw_tid in self.targets:
+                tid = raw_tid
             else:
-                # 1. Çakışan mevcut aktif hedef var mı?
-                matched_active_id = None
-                for act_id, act_t in self.targets.items():
-                    if act_t.det.class_id == raw.class_id and boxes_same_object(
-                        act_t.det.as_xyxy(), raw.as_xyxy(), iou_threshold=config.TRACK_DEDUPE_IOU
-                    ):
-                        matched_active_id = act_id
-                        break
-
-                if matched_active_id is not None:
-                    tid = matched_active_id
+                # Yeni ByteTrack ID'si: Yalnızca kayıp havuzundan (lost_pool) Re-ID eşleştir
+                reid_matched_id = self._try_reid_match(raw, feat)
+                if reid_matched_id is not None and reid_matched_id not in seen:
+                    restored_t = self.lost_pool.pop(reid_matched_id)
+                    tid = reid_matched_id
+                    self.targets[tid] = restored_t
+                    self._id_map[raw_tid] = tid
                 else:
-                    # 2. Kayıp havuzundan Re-ID kontrolü
-                    reid_matched_id = self._try_reid_match(raw, feat)
-                    if reid_matched_id is not None:
-                        restored_t = self.lost_pool.pop(reid_matched_id)
-                        tid = reid_matched_id
-                        self.targets[tid] = restored_t
-                    else:
-                        tid = raw_tid
-
-                self._id_map[raw_tid] = tid
+                    tid = raw_tid
 
             seen.add(tid)
             self._kf(tid).update(raw.cx, raw.cy)
@@ -491,6 +476,7 @@ class TargetTracker:
             self._coast_missing(tid, dx, dy)
 
         return self.targets
+
 
 
     @staticmethod

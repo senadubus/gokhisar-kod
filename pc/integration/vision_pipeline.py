@@ -497,9 +497,10 @@ class VisionPipeline:
                     candidates_input.append((target, IFFLabel.FOE))
                 continue
 
-            # Kayıp maket izini kilit adayı yapma (Sena)
-            if target.misses > 0:
+            # Kayıp maket izini kilit adayı yapma (kısa miss'te Kalman tahminine izin ver)
+            if target.misses > max_miss:
                 continue
+
             record = self.lifecycle.records.get(track_id)
             if record is None or record.iff is not IFFLabel.FOE:
                 continue
