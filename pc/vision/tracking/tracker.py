@@ -369,6 +369,14 @@ class TargetTracker:
             class_id=np.array([d.class_id for d in valid_dets]),
         )
 
+    def _allocate_compact_id(self) -> int:
+        """ByteTrack'in sürekli büyüyen ID sayacı yerine (örn. 178) kullanıcı dostu küçük ID (1, 2, 3...) tahsis eder."""
+        used_ids = set(self.targets.keys()) | set(self.lost_pool.keys()) | set(self._id_map.values())
+        cid = 1
+        while cid in used_ids:
+            cid += 1
+        return cid
+
     def update(
         self, detections: list[Detection], frame: np.ndarray | None = None
     ) -> dict[int, TrackedTarget]:
@@ -415,7 +423,7 @@ class TargetTracker:
             )
             feat = self.reid.extract_feature(frame, (x1, y1, x2, y2))
 
-            # Kanonik ID belirleme (Re-ID / ID Mapping)
+            # Kanonik ve küçük ID belirleme (Re-ID / ID Mapping)
             if raw_tid in self._id_map:
                 tid = self._id_map[raw_tid]
             elif raw_tid in self.targets:
@@ -429,7 +437,9 @@ class TargetTracker:
                     self.targets[tid] = restored_t
                     self._id_map[raw_tid] = tid
                 else:
-                    tid = raw_tid
+                    tid = self._allocate_compact_id()
+                    self._id_map[raw_tid] = tid
+
 
             seen.add(tid)
             self._kf(tid).update(raw.cx, raw.cy)
