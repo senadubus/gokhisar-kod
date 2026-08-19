@@ -3,8 +3,8 @@
 # ---------------- YOLO ----------------
 YOLO_MODEL_PATH = "yolo_modeli.pt"   # eğitilmiş model
 YOLO_IMG_SIZE = 640                  # 480 küçük/uzak balonda kaçırma yapıyordu
-YOLO_CONF_THRESHOLD = 0.45           # balon modeli için 0.35 fazla katı kalabiliyor
-YOLO_IOU_THRESHOLD = 0.5
+YOLO_CONF_THRESHOLD = 0.15          # balon modeli için 0.35 fazla katı kalabiliyor
+YOLO_IOU_THRESHOLD = 0.45
 
 
 CLASS_NAMES = {0: "fuze", 1: "helikopter", 2: "iha", 3: "ucak", 4: "balon"}
@@ -39,10 +39,10 @@ HUE_CYAN_RANGE = (80, 130)
 
 # ---------------- Takip ----------------
 # Sena main (track/performance update) + bizim Kalman/home/servo ayarları
-TRACK_HIGH_CONF = 0.45
+TRACK_HIGH_CONF = 0.35
 TRACK_LOW_CONF = 0.1
-TRACK_BUFFER = 40             # ID sürekliliği (~0.7 sn @~60fps boru / ~2 sn @20fps)
-TRACK_MATCH_IOU = 0.50
+TRACK_BUFFER = 60             # ID sürekliliği (~0.7 sn @~60fps boru / ~2 sn @20fps)
+TRACK_MATCH_IOU = 0.35
 TRACK_DEDUPE_IOU = 0.30
 DEDUPE_IOU = 0.30
 DEDUPE_CENTER_RATIO = 1.1
@@ -79,7 +79,7 @@ AIM_OFFSET_X_PX = 0.0
 AIM_OFFSET_Y_PX = 0.0
 
 # ---------------- İmha Değerlendirme ----------------
-DESTROY_MISS_FRAMES = 15      # yeniden tespit edilememe süresi (kare) — TRACK_BUFFER (30) içinde kalmalı
+DESTROY_MISS_FRAMES = 45      # yeniden tespit edilememe süresi (kare) — TRACK_BUFFER (30) içinde kalmalı 1.5 saniye
 DESTROY_CONF_THRESHOLD = 0.2  # güven skoru eşiği
 
 # ---------------- Haberleşme (PC -> RPi) ----------------
