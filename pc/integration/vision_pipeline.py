@@ -505,10 +505,14 @@ class VisionPipeline:
                 continue
             if record.state in (TargetState.EVALUATE, TargetState.TARGET_LOCK):
                 candidates_input.append((target, record.iff))
-        candidate = self.prioritizer.select(candidates_input)
+        candidate = self.prioritizer.select(candidates_input, current_candidate_id=self._candidate_id)
         if candidate is not None:
             self.lifecycle.on_selected_for_lock(candidate.track_id)
+            self._candidate_id = candidate.track_id
+        else:
+            self._candidate_id = None
         return candidate
+
 
     def _update_lock(self, candidate: TrackedTarget | None) -> bool:
         if candidate is None:

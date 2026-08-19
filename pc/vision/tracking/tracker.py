@@ -269,6 +269,7 @@ class TargetTracker:
         self.gmc = GlobalMotionCompensator()
         self.reid = LightweightHistogramReID()
         self.lost_pool: dict[int, TrackedTarget] = {}
+        self._id_map: dict[int, int] = {}
 
     def set_fps(self, fps: int) -> None:
         """Ölçülen pipeline FPS → ByteTrack zaman adımı (Sena track update)."""
@@ -288,6 +289,7 @@ class TargetTracker:
                 oldest_id = next(iter(self.lost_pool))
                 self.lost_pool.pop(oldest_id, None)
         self._kalmans.pop(track_id, None)
+        self._id_map = {raw_k: can_v for raw_k, can_v in self._id_map.items() if can_v != track_id}
 
     def _coast_missing(self, tid: int, dx: float = 0.0, dy: float = 0.0) -> None:
         """Ölçüm yok: Kalman predict + GMC ötelenmesi + kutuyu ilerlet (hayalet donmasın)."""
@@ -330,16 +332,20 @@ class TargetTracker:
 
         return best_id
 
-    @staticmethod
-    def _suppress_overlapping(tracked: sv.Detections) -> sv.Detections:
-        """Aynı sınıfta yüksek örtüşen takiplerden yalnızca en güvenilir olanı bırak."""
+    def _suppress_overlapping(self, tracked: sv.Detections) -> sv.Detections:
+        """Aynı sınıfta yüksek örtüşen takiplerden yalnızca en güvenilir/aktif olanı bırak."""
         n = len(tracked)
         if n <= 1:
             return tracked
 
-        order = sorted(
-            range(n), key=lambda i: _as_float(tracked.confidence[i]), reverse=True
-        )
+        def sort_key(i: int) -> float:
+            raw_tid = _as_int(tracked.tracker_id[i]) if tracked.tracker_id is not None else -1
+            can_id = self._id_map.get(raw_tid, raw_tid)
+            is_active = 1.0 if can_id in self.targets else 0.0
+            conf = _as_float(tracked.confidence[i])
+            return is_active * 2.0 + conf
+
+        order = sorted(range(n), key=sort_key, reverse=True)
         keep: list[int] = []
         for i in order:
             cls_i = _as_int(tracked.class_id[i])
@@ -394,13 +400,13 @@ class TargetTracker:
             return self.targets
 
         seen: set[int] = set()
-        for xyxy, conf, cls_id, tid in zip(
+        for xyxy, conf, cls_id, raw_tid in zip(
             tracked.xyxy,
             tracked.confidence,
             tracked.class_id,
             tracked.tracker_id,
         ):
-            tid = _as_int(tid)
+            raw_tid = _as_int(raw_tid)
             x1, y1, x2, y2 = (float(v) for v in np.asarray(xyxy).reshape(-1)[:4])
             raw = Detection(
                 x1,
@@ -413,14 +419,32 @@ class TargetTracker:
             )
             feat = self.reid.extract_feature(frame, (x1, y1, x2, y2))
 
-            # Yeni iz oluştuğunda kayıp havuzundan Re-ID kontrolü yap
-            if tid not in self.targets:
-                reid_matched_id = self._try_reid_match(raw, feat)
-                if reid_matched_id is not None:
-                    restored_t = self.lost_pool.pop(reid_matched_id)
-                    self._drop(tid)
-                    tid = reid_matched_id
-                    self.targets[tid] = restored_t
+            # Kanonik ID belirleme (ID Mapping)
+            if raw_tid in self._id_map:
+                tid = self._id_map[raw_tid]
+            else:
+                # 1. Çakışan mevcut aktif hedef var mı?
+                matched_active_id = None
+                for act_id, act_t in self.targets.items():
+                    if act_t.det.class_id == raw.class_id and boxes_same_object(
+                        act_t.det.as_xyxy(), raw.as_xyxy(), iou_threshold=config.TRACK_DEDUPE_IOU
+                    ):
+                        matched_active_id = act_id
+                        break
+
+                if matched_active_id is not None:
+                    tid = matched_active_id
+                else:
+                    # 2. Kayıp havuzundan Re-ID kontrolü
+                    reid_matched_id = self._try_reid_match(raw, feat)
+                    if reid_matched_id is not None:
+                        restored_t = self.lost_pool.pop(reid_matched_id)
+                        tid = reid_matched_id
+                        self.targets[tid] = restored_t
+                    else:
+                        tid = raw_tid
+
+                self._id_map[raw_tid] = tid
 
             seen.add(tid)
             self._kf(tid).update(raw.cx, raw.cy)
@@ -467,6 +491,7 @@ class TargetTracker:
             self._coast_missing(tid, dx, dy)
 
         return self.targets
+
 
     @staticmethod
     def stability(t: TrackedTarget) -> float:

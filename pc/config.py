@@ -76,6 +76,7 @@ W_CENTER = 0.25                # kamera merkezine yakınlık ağırlığı
 W_STABILITY = 0.20             # takip kararlılığı ağırlığı
 W_ENGAGEMENT = 0.10            # angajman uygunluğu ağırlığı (IFF)
 W_SERVO = 0.10                 # servo yönelim kararlılığı ağırlığı
+CANDIDATE_HYSTERESIS = 0.15    # Aday değişimi için gereken puan farkı (bağlılık primi)
 
 # ---------------- Kilitlenme (balon nişanı) ----------------
 # 640 genişlikte ~aynı açısal bant (~90 px @1280)
