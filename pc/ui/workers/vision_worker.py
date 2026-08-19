@@ -272,8 +272,7 @@ class VisionWorker(BaseWorker):
             label = view.display_name
             if view.locked:
                 label = f"{label} [KİLİT]"
-            elif view.is_candidate:
-                label = f"{label} [ADAY]"
+
 
 
             drawables.append(Detection(
