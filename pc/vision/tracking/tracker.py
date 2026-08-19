@@ -442,9 +442,10 @@ class TargetTracker:
 
 
             seen.add(tid)
-            self._kf(tid).update(raw.cx, raw.cy)
-            det = raw
-            fx, fy = raw.cx, raw.cy
+            kx, ky = self._kf(tid).update(raw.cx, raw.cy)
+            det = _detection_at_center(raw, kx, ky, conf=raw.conf)
+            fx, fy = kx, ky
+
 
             if tid in self.targets:
                 t = self.targets[tid]

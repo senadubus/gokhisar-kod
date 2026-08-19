@@ -49,7 +49,7 @@ DEDUPE_CENTER_RATIO = 1.1
 TRACK_MAX_DRAW_MISSES = 2     # UI: Yalnızca canlı tespitleri çiz (kırpık/tahmini hayalet kutuları gösterme)
 
 # Hafif Re-ID & Kamera Hareket Dengeleme (GMC)
-ENABLE_GMC = True             # Pan/Tilt kamera sarsıntısını piksel düzleminde telafi et
+ENABLE_GMC = False            # Pan/Tilt kamera sarsıntısını piksel düzleminde telafi et (CPU/FPS kazancı için kapalı)
 ENABLE_REID = True            # HSV Renk Parmak İzi ile ID kurtarma (Re-Identification)
 REID_SIMILARITY_THRESHOLD = 0.65  # Benzerlik eşiği (0.0 - 1.0)
 REID_MAX_DISTANCE_PX = 180.0  # Maksimum kabul edilebilir merkez mesafesi (px)
