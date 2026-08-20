@@ -166,7 +166,6 @@ class VisionWorker(BaseWorker):
         hints = {
             "ultralytics": "pip install 'ultralytics>=8.2,<9'",
             "torch": "pip install torch",
-            "supervision": "pip install 'supervision>=0.20'",
             "cv2": "pip install opencv-python",
             "filterpy": "pip install filterpy",
         }
@@ -249,10 +248,9 @@ class VisionWorker(BaseWorker):
     def _to_detection_frame(self, result, *, queue_ms: float = 0.0) -> DetectionFrame:
         """`PipelineResult`'ı mevcut çizim katmanının anladığı biçime çevir.
 
-        Çizilenler: takip edilen her hedef (IFF rengiyle) ve takip altına
-        girmemiş balonlar. Balonlar ByteTrack'in aktivasyon eşiğinin altında
-        kaldığı için hiçbir zaman iz üretmez; ama doğrulamanın neye baktığını
-        operatörün görmesi gerekir.
+        Çizilenler: yalnız takip edilen hedefler (IFF rengiyle). Takibe
+        girmemiş ham balon kutuları çizilmez — HSV/YOLO gürültüsü ekranı
+        doldurmasın; operatör zaten track etiketinden görür.
         """
         drawables: list[Detection] = []
 
@@ -260,8 +258,17 @@ class VisionWorker(BaseWorker):
             is_balloon = view.config_class_id == BALLOON_CLASS_ID
             if view.locked:
                 color = COLOR_LOCKED
+            elif getattr(view, "predicted", False):
+                # Kalman tahmini — ölçüm yok, kutu ilerliyor
+                color = (180, 180, 220)
             elif is_balloon:
-                color = COLOR_BALLOON
+                # Aşama-3: balon IFF rengi (üstünde kırmızı=düşman, camgöbeği=dost)
+                if view.is_friendly is True:
+                    color = COLOR_FRIEND
+                elif view.is_friendly is False:
+                    color = COLOR_FOE
+                else:
+                    color = COLOR_BALLOON
             elif view.is_friendly is True:
                 color = COLOR_FRIEND
             elif view.is_friendly is False:
@@ -272,8 +279,10 @@ class VisionWorker(BaseWorker):
             label = view.display_name
             if view.locked:
                 label = f"{label} [KİLİT]"
-
-
+            elif view.is_candidate:
+                label = f"{label} [ADAY]"
+            if getattr(view, "predicted", False):
+                label = f"{label} [TAHMİN]"
 
             drawables.append(Detection(
                 bbox_xyxy=view.bbox,
@@ -282,20 +291,6 @@ class VisionWorker(BaseWorker):
                 confidence=view.confidence,
                 color=color,
                 track_id=view.track_id,
-            ))
-
-        tracked_boxes = [view.bbox for view in result.tracks]
-        for det in result.detections:
-            if det.class_id != BALLOON_CLASS_ID:
-                continue
-            if any(_overlaps(det, box) for box in tracked_boxes):
-                continue
-            drawables.append(Detection(
-                bbox_xyxy=(det.x1, det.y1, det.x2, det.y2),
-                cls_id=det.class_id,
-                cls_name="Balon",
-                confidence=det.conf,
-                color=COLOR_BALLOON,
             ))
 
         total_ms = float(getattr(result, "total_ms", 0.0) or 0.0)
@@ -320,16 +315,3 @@ class VisionWorker(BaseWorker):
             self._pending_frame = None
         self._frame_cond.wakeAll()
         super().stop_worker()
-
-
-def _overlaps(det, box: tuple[float, float, float, float], threshold: float = 0.5) -> bool:
-    """Tespit, verilen kutuyla büyük ölçüde çakışıyor mu (IoU)."""
-    bx1, by1, bx2, by2 = box
-    ix1, iy1 = max(det.x1, bx1), max(det.y1, by1)
-    ix2, iy2 = min(det.x2, bx2), min(det.y2, by2)
-    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
-    intersection = iw * ih
-    if intersection <= 0.0:
-        return False
-    union = det.area + (bx2 - bx1) * (by2 - by1) - intersection
-    return union > 0 and intersection / union > threshold

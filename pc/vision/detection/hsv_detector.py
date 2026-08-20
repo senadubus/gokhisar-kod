@@ -176,7 +176,7 @@ class HsvBalloonDetector:
         for cx, cy, r in self._candidates(mask):
             detections.append(
                 Detection(cx - r, cy - r, cx + r, cy + r,
-                          conf=0.4,                     # sabit ön güven
+                          conf=0.35,  # gerçek skor değil; BALLOON_CONF_THRESHOLD altı kalır
                           class_id=config.BALLOON_CLASS_ID,
                           source="hsv")
             )
@@ -237,7 +237,7 @@ class HsvBalloonDetector:
             abs_cy = y1 + cy
             dets.append(
                 Detection(abs_cx - r, abs_cy - r, abs_cx + r, abs_cy + r,
-                          conf=0.4,
+                          conf=0.35,
                           class_id=config.BALLOON_CLASS_ID,
                           source="hsv")
             )
@@ -273,7 +273,7 @@ class HsvBalloonDetector:
                 continue
             detections.append(
                 Detection(cx - r, cy - r, cx + r, cy + r,
-                          conf=0.3,
+                          conf=0.35,
                           class_id=config.BALLOON_CLASS_ID,
                           source="hsv")
             )

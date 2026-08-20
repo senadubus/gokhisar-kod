@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # gokhisar shared/classes.py TargetClass ile aynı
 PEER_CLASS_NAMES = {
@@ -39,10 +40,13 @@ class MissionState:
     enable: bool = True
     home: bool = False
     estop: bool = False
-    frame_w: int = 1280
-    frame_h: int = 720
-    # gokhisar YKİ'den gelen PID katsayıları; ana döngü tüketince None olur.
-    pid_gains: Optional[tuple[float, float, float]] = None
+    frame_w: int = 640
+    frame_h: int = 480
+    target_mono: float = 0.0
+    pid_kp: Optional[float] = None
+    pid_ki: Optional[float] = None
+    pid_kd: Optional[float] = None
+    pid_dirty: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def snapshot(self) -> "MissionState":
@@ -69,6 +73,11 @@ class MissionState:
                 estop=self.estop,
                 frame_w=self.frame_w,
                 frame_h=self.frame_h,
+                target_mono=self.target_mono,
+                pid_kp=self.pid_kp,
+                pid_ki=self.pid_ki,
+                pid_kd=self.pid_kd,
+                pid_dirty=self.pid_dirty,
             )
 
     def consume_manual_delta(self) -> tuple[float, float]:
@@ -78,28 +87,27 @@ class MissionState:
             self.manual_dtilt = 0.0
             return dpan, dtilt
 
-    def consume_pid_gains(self) -> Optional[tuple[float, float, float]]:
-        """Bekleyen PID katsayılarını al; yoksa None.
-
-        Katsayıyı her döngüde yeniden uygulamak yerine tek seferlik tüketmek
-        gerekiyor: `PID.set_gains()` integrali sıfırlıyor, her turda çağrılsa
-        integral terimi hiç birikemezdi.
-        """
-        with self.lock:
-            gains = self.pid_gains
-            self.pid_gains = None
-            return gains
-
     def clear_engage(self) -> None:
         with self.lock:
             self.engage_active = False
             self.fire = False
 
+    def clear_pid_dirty(self) -> None:
+        with self.lock:
+            self.pid_dirty = False
+
+    def _clear_track(self) -> None:
+        self.track_id = -1
+        self.class_id = -1
+        self.locked = False
+        self.err_x = 0.0
+        self.err_y = 0.0
+        self.target_mono = 0.0
+
     def apply_message(self, msg: dict[str, Any]) -> None:
         t = msg.get("type", "")
         with self.lock:
             if t == "mode":
-                # gokhisar: {"type":"mode","autonomous":true}
                 if "autonomous" in msg:
                     self.mode = "otonom" if bool(msg["autonomous"]) else "manuel"
                     if bool(msg["autonomous"]) and self.stage < 2:
@@ -108,17 +116,21 @@ class MissionState:
                         self.engage_active = False
                         self.fire = False
                         self.arm = False
+                        self._clear_track()
                 if "mode" in msg:
                     m = str(msg["mode"]).lower()
                     if m in ("otonom", "auto", "autonomous"):
                         self.mode = "otonom"
                     elif m in ("manuel", "manual"):
                         self.mode = "manuel"
+                        self.engage_active = False
+                        self.fire = False
+                        self.arm = False
+                        self._clear_track()
                 if "stage" in msg:
                     self.stage = int(msg["stage"])
 
             elif t == "manual":
-                # gokhisar: {"type":"manual","dx":±5,"dy":±5} — açı adımı
                 self.mode = "manuel"
                 if self.stage == 0:
                     self.stage = 1
@@ -126,34 +138,36 @@ class MissionState:
                 self.manual_dtilt += float(msg.get("dy", 0.0))
 
             elif t == "target":
-                # gokhisar: cx/cy mutlak merkez; biz err = cx - W/2
-                if "cx" in msg and "cy" in msg:
-                    cx = float(msg["cx"])
-                    cy = float(msg["cy"])
-                    self.err_x = cx - (self.frame_w * 0.5)
-                    self.err_y = cy - (self.frame_h * 0.5)
-                if "err_x" in msg:
-                    self.err_x = float(msg["err_x"])
-                if "err_y" in msg:
-                    self.err_y = float(msg["err_y"])
-
-                if "class_id" in msg:
-                    self.class_id = int(msg["class_id"])
-                    if "class_name" not in msg and "class" not in msg:
-                        self.class_name = PEER_CLASS_NAMES.get(self.class_id, self.class_name)
-                if "class_name" in msg:
-                    self.class_name = str(msg["class_name"])
-                elif "class" in msg:
-                    self.class_name = str(msg["class"])
-
-                if "iff" in msg:
-                    self.iff = str(msg["iff"])
-                if "track_id" in msg:
-                    self.track_id = int(msg["track_id"])
-                if "locked" in msg:
-                    self.locked = bool(msg["locked"])
-                if "stage" in msg:
-                    self.stage = int(msg["stage"])
+                # KTR: hedef yalnız otonom 2+
+                if self.mode == "otonom" and self.stage >= 2:
+                    self.target_mono = time.monotonic()
+                    if "cx" in msg and "cy" in msg:
+                        cx = float(msg["cx"])
+                        cy = float(msg["cy"])
+                        self.err_x = cx - (self.frame_w * 0.5)
+                        self.err_y = cy - (self.frame_h * 0.5)
+                    if "err_x" in msg:
+                        self.err_x = float(msg["err_x"])
+                    if "err_y" in msg:
+                        self.err_y = float(msg["err_y"])
+                    if "class_id" in msg:
+                        self.class_id = int(msg["class_id"])
+                        if "class_name" not in msg and "class" not in msg:
+                            self.class_name = PEER_CLASS_NAMES.get(
+                                self.class_id, self.class_name
+                            )
+                    if "class_name" in msg:
+                        self.class_name = str(msg["class_name"])
+                    elif "class" in msg:
+                        self.class_name = str(msg["class"])
+                    if "iff" in msg:
+                        self.iff = str(msg["iff"])
+                    if "track_id" in msg:
+                        self.track_id = int(msg["track_id"])
+                    if "locked" in msg:
+                        self.locked = bool(msg["locked"])
+                    if "stage" in msg:
+                        self.stage = int(msg["stage"])
 
             elif t == "engage":
                 # gokhisar angajman talebi → arm+fire niyeti
@@ -177,15 +191,6 @@ class MissionState:
                 if self.fire:
                     self.engage_active = True
 
-            elif t == "pid":
-                # gokhisar YKİ: {"type":"pid","kp":..,"ki":..,"kd":..}
-                try:
-                    self.pid_gains = (
-                        float(msg["kp"]), float(msg["ki"]), float(msg["kd"])
-                    )
-                except (KeyError, TypeError, ValueError):
-                    pass
-
             elif t == "servo":
                 if "pan_deg" in msg:
                     self.pan_cmd_deg = float(msg["pan_deg"])
@@ -206,6 +211,16 @@ class MissionState:
                 self.estop = False
             elif t == "stage":
                 self.stage = int(msg.get("stage", self.stage))
+            elif t == "pid":
+                if "kp" in msg:
+                    self.pid_kp = float(msg["kp"])
+                if "ki" in msg:
+                    self.pid_ki = float(msg["ki"])
+                if "kd" in msg:
+                    self.pid_kd = float(msg["kd"])
+                self.pid_dirty = True
+            elif t == "video":
+                pass
 
 
 class TcpJsonServer:
@@ -214,10 +229,16 @@ class TcpJsonServer:
         host: str = "0.0.0.0",
         port: int = 5005,
         state: Optional[MissionState] = None,
+        on_client_connect: Optional[Callable[[str], None]] = None,
+        on_client_disconnect: Optional[Callable[[str], None]] = None,
+        on_message: Optional[Callable[[dict[str, Any], str], None]] = None,
     ) -> None:
         self.host = host
         self.port = port
         self.state = state or MissionState()
+        self.on_client_connect = on_client_connect
+        self.on_client_disconnect = on_client_disconnect
+        self.on_message = on_message
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -267,17 +288,25 @@ class TcpJsonServer:
         assert self._sock is not None
         while not self._stop.is_set():
             try:
-                conn, _addr = self._sock.accept()
+                conn, addr = self._sock.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
+            peer = addr[0] if addr else ""
             conn.settimeout(0.5)
             with self._clients_lock:
                 self._clients.append(conn)
-            threading.Thread(target=self._client_loop, args=(conn,), daemon=True).start()
+            if self.on_client_connect and peer:
+                try:
+                    self.on_client_connect(peer)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[WARN] on_client_connect: {exc}")
+            threading.Thread(
+                target=self._client_loop, args=(conn, peer), daemon=True
+            ).start()
 
-    def _client_loop(self, conn: socket.socket) -> None:
+    def _client_loop(self, conn: socket.socket, peer: str = "") -> None:
         buf = b""
         try:
             while not self._stop.is_set():
@@ -299,6 +328,11 @@ class TcpJsonServer:
                         continue
                     if isinstance(msg, dict):
                         self.state.apply_message(msg)
+                        if self.on_message:
+                            try:
+                                self.on_message(msg, peer)
+                            except Exception as exc:  # noqa: BLE001
+                                print(f"[WARN] on_message: {exc}")
         finally:
             with self._clients_lock:
                 if conn in self._clients:
@@ -307,3 +341,8 @@ class TcpJsonServer:
                 conn.close()
             except OSError:
                 pass
+            if self.on_client_disconnect and peer:
+                try:
+                    self.on_client_disconnect(peer)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[WARN] on_client_disconnect: {exc}")

@@ -134,11 +134,11 @@ class PipelineSettings:
 
     weights_path: Path | None = field(default_factory=resolve_weights_path)
 
-    # HSV yardımcı tespiti ve dinamik ROI iyileştirmesi (KTR 4.2.2.1).
-    # Kapatmak boru hattını saf YOLO'ya indirger; zayıf donanımda kare hızını
-    # yükseltmek için kullanılabilir.
-    hsv_assist: bool = True
-    roi_refine: bool = True
+    # HSV yardımcı tespiti varsayılan KAPALI: kırmızı kıyafet/İHA sahte balon
+    # basıyor ve conf'u sabit yazıldığı için 0.60 eşiğini deliyordu.
+    # Açmak: GOKHISAR_HSV_ASSIST=1
+    hsv_assist: bool = False
+    roi_refine: bool = False
     # ROI iyileştirmesi her aday için ayrı bir YOLO çıkarımı demektir. Sınırsız
     # bırakılırsa gürültülü bir karede kare süresi patlar; en büyük N adayla
     # sınırlıyoruz.
@@ -162,8 +162,8 @@ class PipelineSettings:
     def from_env(cls) -> "PipelineSettings":
         return cls(
             weights_path=resolve_weights_path(),
-            hsv_assist=_env_flag("GOKHISAR_HSV_ASSIST", True),
-            roi_refine=_env_flag("GOKHISAR_ROI_REFINE", True),
+            hsv_assist=_env_flag("GOKHISAR_HSV_ASSIST", False),
+            roi_refine=_env_flag("GOKHISAR_ROI_REFINE", False),
                     max_roi_refine=_env_int("GOKHISAR_MAX_ROI_REFINE", 2),
             destroy_eval_delay_s=_env_float("GOKHISAR_DESTROY_DELAY_S", 2.0),
             engage_repeat_s=_env_float("GOKHISAR_ENGAGE_REPEAT_S", 1.0),

@@ -68,7 +68,7 @@ class Detection:
     # color : sınıf rengi yerine kullanılacak RGB. IFF sonucu renkle
     #         taşındığı için (DOST yeşil / DÜŞMAN kırmızı) sınıf renginden
     #         daha bilgilendiricidir.
-    # track_id : ByteTrack kimliği; etikette "#3" olarak gösterilir, böylece
+    # track_id : BotSORT kimliği; etikette "#3" olarak gösterilir, böylece
     #         operatör aynı hedefin kareler boyunca korunduğunu görebilir.
     color: tuple[int, int, int] | None = None
     track_id: int | None = None

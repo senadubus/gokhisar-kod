@@ -14,7 +14,7 @@ Kare başına akış (KTR 4.2.2.1 – 4.2.2.10)::
       ├─ HSV küçük hedef tespiti             (4.2.2.1)
       ├─ dinamik ROI'de YOLO yeniden çıkarım (4.2.2.1)
       ├─ maket–balon eşleştirme              (4.2.2.2)
-      ├─ ByteTrack ile kimlik sürekliliği    (4.2.2.4)
+      ├─ BotSORT ile kimlik sürekliliği      (4.2.2.4)
       ├─ HSV + zamansal oylamalı IFF         (4.2.2.3)
       ├─ ağırlıklı öncelik puanı             (4.2.2.5)
       ├─ kilit toleransı denetimi            (4.2.2.6)
@@ -257,15 +257,17 @@ class VisionPipeline:
                 validated, _unmatched = self.matcher.match(frame, models, balloons)
 
         with self.latency.measure("tracking"):
-            tracked = self.tracker.update(detections, frame=frame)
+            tracked = self.tracker.update(detections, frame)
             self._accumulate_servo_corrections(tracked)
 
-        validated_ids = self._link_validated_to_tracks(validated, tracked)
+        validated_ids, balloon_markers = self._link_validated_to_tracks(
+            validated, tracked
+        )
         for track_id in validated_ids:
             self.lifecycle.on_validated(track_id)
 
         with self.latency.measure("iff_classification"):
-            self._run_iff(frame, tracked)
+            self._run_iff(frame, tracked, balloon_markers)
 
         with self.latency.measure("prioritization"):
             candidate = self._select_candidate(tracked)
@@ -371,7 +373,28 @@ class VisionPipeline:
                         roi = HsvBalloonDetector.dynamic_roi(balloon, frame.shape)
                         roi_dets.extend(self._remap(self.yolo.detect_in_roi(frame, roi)))
 
-        return self._dedupe(yolo_dets + roi_dets + hsv_dets), inference_ms
+        return self._filter_balloon_conf(
+            self._dedupe(yolo_dets + roi_dets + hsv_dets)
+        ), inference_ms
+
+    @staticmethod
+    def _filter_balloon_conf(detections: list[Detection]) -> list[Detection]:
+        """Zayıf / HSV uydurma balonları sil; maket sınıflarına dokunma.
+
+        HSV conf sabit yazıldığı için eşiği delmesin diye ``source=="hsv"``
+        adaylar her zaman elenir; yalnızca YOLO (ve ROI-YOLO) balonları kalır.
+        """
+        thr = float(getattr(vision_config, "BALLOON_CONF_THRESHOLD", 0.60))
+        kept: list[Detection] = []
+        for d in detections:
+            if d.class_id != BALLOON_CLASS_ID:
+                kept.append(d)
+                continue
+            if getattr(d, "source", "") == "hsv":
+                continue
+            if d.conf >= thr:
+                kept.append(d)
+        return kept
 
     def _balloons_needing_refine(
         self, balloons: list[Detection], models: list[Detection]
@@ -414,7 +437,7 @@ class VisionPipeline:
         """Aynı nesnenin farklı yollardan gelen kopyalarını tekilleştir.
 
         Tam kare YOLO ile ROI YOLO çoğu zaman aynı maketi iki kez üretir; ikisi
-        de takibe girerse ByteTrack aynı nesneye iki kimlik verir ve öncelik
+        de takibe girerse BotSORT aynı nesneye iki kimlik verir ve öncelik
         sıralaması bozulur. Güveni yüksek olan tutulur.
         """
         kept: list[Detection] = []
@@ -443,30 +466,56 @@ class VisionPipeline:
                 del target.servo_corrections[:-_SERVO_HISTORY_LEN]
 
     @staticmethod
-    def _link_validated_to_tracks(validated, tracked: dict[int, TrackedTarget]) -> set[int]:
-        """Doğrulanmış maketleri takip kimlikleriyle ilişkilendir.
+    def _link_validated_to_tracks(
+        validated, tracked: dict[int, TrackedTarget]
+    ) -> tuple[set[int], dict[int, Detection]]:
+        """Doğrulanmış maket–balon çiftlerini takip kimlikleriyle ilişkilendir.
 
-        `TargetMatcher` takipten önceki ham tespitlerle çalışır ve takip kimliği
-        bilmez; ByteTrack ise kutuyu Kalman tahminiyle bir miktar oynatır. İki
-        taraf en yüksek örtüşmeye göre eşleştirilir.
+        Dönüş: (doğrulanan track id'leri, balon_track_id → maket Detection).
+        Aşama-3'te balon IFF, balon gövdesine değil bu maket kutusuna bakar.
         """
         matched: set[int] = set()
+        balloon_markers: dict[int, Detection] = {}
         for operational in validated:
-            best_id, best_iou = None, _VALIDATION_IOU
+            best_model, best_model_iou = None, _VALIDATION_IOU
+            best_balloon, best_balloon_iou = None, _VALIDATION_IOU
             for track_id, target in tracked.items():
-                if target.det.class_id not in MODEL_CLASS_IDS:
-                    continue
-                score = _iou(target.det, operational.model_det)
-                if score > best_iou:
-                    best_id, best_iou = track_id, score
-            if best_id is not None:
-                matched.add(best_id)
-        return matched
+                if target.det.class_id in MODEL_CLASS_IDS:
+                    score = _iou(target.det, operational.model_det)
+                    if score > best_model_iou:
+                        best_model, best_model_iou = track_id, score
+                elif target.det.class_id == BALLOON_CLASS_ID:
+                    score = _iou(target.det, operational.balloon_det)
+                    if score > best_balloon_iou:
+                        best_balloon, best_balloon_iou = track_id, score
+            if best_model is not None:
+                matched.add(best_model)
+            if best_balloon is not None:
+                matched.add(best_balloon)
+                balloon_markers[best_balloon] = operational.model_det
+        return matched, balloon_markers
 
-    def _run_iff(self, frame: np.ndarray, tracked: dict[int, TrackedTarget]) -> None:
-        """Dost-düşman sınıflandırmasını çalıştır (balonlar hedef değildir)."""
+    def _run_iff(
+        self,
+        frame: np.ndarray,
+        tracked: dict[int, TrackedTarget],
+        balloon_markers: dict[int, Detection] | None = None,
+    ) -> None:
+        """Dost-düşman sınıflandırması.
+
+        Maket: kutu rengi. Balon (aşama-3): yalnız üstündeki kırmızı/camgöbeği
+        nesne; gövde kırmızısı düşman sayılmaz. Aşama-2: balonlar düşman.
+        """
+        markers = balloon_markers or {}
         for track_id, target in tracked.items():
             if target.det.class_id == BALLOON_CLASS_ID:
+                label = self.iff.classify_balloon(
+                    frame,
+                    target.det,
+                    track_id,
+                    marker_det=markers.get(track_id),
+                )
+                self.lifecycle.on_iff(track_id, label)
                 continue
             label = self.iff.classify(frame, target.det, track_id)
             self.lifecycle.on_iff(track_id, label)
@@ -474,8 +523,8 @@ class VisionPipeline:
     def _select_candidate(self, tracked: dict[int, TrackedTarget]) -> TrackedTarget | None:
         """Angajman / takip adayını seç.
 
-        Balon-only modelde maket+IFF yok; balonlar doğrudan takip adayı olur
-        (servo merkeze götürsün). Ateş kararı ayrı kapılarda kalır.
+        Aşama-3'te balon yalnız IFF=DÜŞMAN ise aday olur (üstünde kırmızı
+        nesne). Aşama-2'de balonlar düşman kabul edilir.
         """
         # Test/KTR: kısa miss'te Kalman tahmini varken adayı hemen bırakma
         max_miss = int(getattr(vision_config, "TRACK_CANDIDATE_MAX_MISSES", 5))
@@ -487,33 +536,29 @@ class VisionPipeline:
                 if target.misses > max_miss:
                     continue
                 rec = self.lifecycle.get(track_id)
-                # Matcher/IFF balonu atladığı için yaşam döngüsünü burada ilerlet.
                 if rec.state is TargetState.DETECT:
                     rec.state = TargetState.TRACK
+                # Aşama-2: IFF zaten FOE yazar. Aşama-3: hardcode yok.
+                if rec.iff is not IFFLabel.FOE:
+                    continue
                 if rec.state is TargetState.TRACK:
-                    rec.iff = IFFLabel.FOE
                     rec.state = TargetState.EVALUATE
                 if rec.state in (TargetState.EVALUATE, TargetState.TARGET_LOCK):
-                    candidates_input.append((target, IFFLabel.FOE))
+                    candidates_input.append((target, rec.iff))
                 continue
 
-            # Kayıp maket izini kilit adayı yapma (kısa miss'te Kalman tahminine izin ver)
-            if target.misses > max_miss:
+            # Kayıp maket izini kilit adayı yapma (Sena)
+            if target.misses > 0:
                 continue
-
             record = self.lifecycle.records.get(track_id)
             if record is None or record.iff is not IFFLabel.FOE:
                 continue
             if record.state in (TargetState.EVALUATE, TargetState.TARGET_LOCK):
                 candidates_input.append((target, record.iff))
-        candidate = self.prioritizer.select(candidates_input, current_candidate_id=self._candidate_id)
+        candidate = self.prioritizer.select(candidates_input)
         if candidate is not None:
             self.lifecycle.on_selected_for_lock(candidate.track_id)
-            self._candidate_id = candidate.track_id
-        else:
-            self._candidate_id = None
         return candidate
-
 
     def _update_lock(self, candidate: TrackedTarget | None) -> bool:
         if candidate is None:
