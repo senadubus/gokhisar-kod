@@ -248,10 +248,9 @@ class VisionWorker(BaseWorker):
     def _to_detection_frame(self, result, *, queue_ms: float = 0.0) -> DetectionFrame:
         """`PipelineResult`'ı mevcut çizim katmanının anladığı biçime çevir.
 
-        Çizilenler: takip edilen her hedef (IFF rengiyle) ve takip altına
-        girmemiş balonlar. Balonlar BotSORT'un aktivasyon eşiğinin altında
-        kaldığı için hiçbir zaman iz üretmez; ama doğrulamanın neye baktığını
-        operatörün görmesi gerekir.
+        Çizilenler: yalnız takip edilen hedefler (IFF rengiyle). Takibe
+        girmemiş ham balon kutuları çizilmez — HSV/YOLO gürültüsü ekranı
+        doldurmasın; operatör zaten track etiketinden görür.
         """
         drawables: list[Detection] = []
 
@@ -288,20 +287,6 @@ class VisionWorker(BaseWorker):
                 track_id=view.track_id,
             ))
 
-        tracked_boxes = [view.bbox for view in result.tracks]
-        for det in result.detections:
-            if det.class_id != BALLOON_CLASS_ID:
-                continue
-            if any(_overlaps(det, box) for box in tracked_boxes):
-                continue
-            drawables.append(Detection(
-                bbox_xyxy=(det.x1, det.y1, det.x2, det.y2),
-                cls_id=det.class_id,
-                cls_name="Balon",
-                confidence=det.conf,
-                color=COLOR_BALLOON,
-            ))
-
         total_ms = float(getattr(result, "total_ms", 0.0) or 0.0)
         fps = (1000.0 / total_ms) if total_ms > 1.0 else 0.0
         summary = dict(getattr(result, "latency_summary", {}) or {})
@@ -324,16 +309,3 @@ class VisionWorker(BaseWorker):
             self._pending_frame = None
         self._frame_cond.wakeAll()
         super().stop_worker()
-
-
-def _overlaps(det, box: tuple[float, float, float, float], threshold: float = 0.5) -> bool:
-    """Tespit, verilen kutuyla büyük ölçüde çakışıyor mu (IoU)."""
-    bx1, by1, bx2, by2 = box
-    ix1, iy1 = max(det.x1, bx1), max(det.y1, by1)
-    ix2, iy2 = min(det.x2, bx2), min(det.y2, by2)
-    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
-    intersection = iw * ih
-    if intersection <= 0.0:
-        return False
-    union = det.area + (bx2 - bx1) * (by2 - by1) - intersection
-    return union > 0 and intersection / union > threshold

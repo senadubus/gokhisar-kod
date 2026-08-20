@@ -377,12 +377,22 @@ class VisionPipeline:
 
     @staticmethod
     def _filter_balloon_conf(detections: list[Detection]) -> list[Detection]:
-        """Balon conf < BALLOON_CONF_THRESHOLD olanları sil; diğer sınıflara dokunma."""
+        """Zayıf / HSV uydurma balonları sil; maket sınıflarına dokunma.
+
+        HSV conf sabit yazıldığı için eşiği delmesin diye ``source=="hsv"``
+        adaylar her zaman elenir; yalnızca YOLO (ve ROI-YOLO) balonları kalır.
+        """
         thr = float(getattr(vision_config, "BALLOON_CONF_THRESHOLD", 0.60))
-        return [
-            d for d in detections
-            if d.class_id != BALLOON_CLASS_ID or d.conf >= thr
-        ]
+        kept: list[Detection] = []
+        for d in detections:
+            if d.class_id != BALLOON_CLASS_ID:
+                kept.append(d)
+                continue
+            if getattr(d, "source", "") == "hsv":
+                continue
+            if d.conf >= thr:
+                kept.append(d)
+        return kept
 
     def _balloons_needing_refine(
         self, balloons: list[Detection], models: list[Detection]
