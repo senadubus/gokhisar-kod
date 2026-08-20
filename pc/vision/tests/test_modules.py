@@ -1,4 +1,5 @@
 """pytest ile otomatize testler (rapor: iteratif prototipleme + pytest)."""
+import cv2
 import numpy as np
 import pytest
 
@@ -18,7 +19,6 @@ def make_frame(color=(0, 0, 0)):
 
 
 def draw_circle(frame, center, r, bgr):
-    import cv2
     cv2.circle(frame, center, r, bgr, -1)
     return frame
 
@@ -74,6 +74,36 @@ def test_iff_stage2_all_foe():
     clf = FriendFoeClassifier(stage=2)
     det = Detection(0, 0, 10, 10, 0.9, 0)
     assert clf.classify(make_frame(), det, track_id=5) is IFFLabel.FOE
+
+
+def test_iff_balloon_stage3_needs_red_marker_on_top():
+    """Aşama-3: yalnız üstünde kırmızı nesne olan balon düşman."""
+    clf = FriendFoeClassifier(stage=3)
+    frame = make_frame((40, 40, 40))
+    # Balon gövdesi kırmızı (altta) — tek başına düşman sayılmamalı
+    cv2.rectangle(frame, (300, 300), (400, 400), (0, 0, 220), -1)
+    balloon = Detection(300, 300, 400, 400, 0.9, config.BALLOON_CLASS_ID)
+    for _ in range(config.IFF_VOTE_MIN_FRAMES + 2):
+        label = clf.classify_balloon(frame, balloon, track_id=10)
+    assert label is IFFLabel.UNKNOWN
+
+    # Üste kırmızı maket/işaret ekle → düşman
+    cv2.rectangle(frame, (320, 220), (380, 290), (0, 0, 255), -1)
+    clf2 = FriendFoeClassifier(stage=3)
+    for _ in range(config.IFF_VOTE_MIN_FRAMES + 2):
+        label = clf2.classify_balloon(frame, balloon, track_id=11)
+    assert label is IFFLabel.FOE
+
+
+def test_iff_balloon_stage3_cyan_marker_is_friend():
+    clf = FriendFoeClassifier(stage=3)
+    frame = make_frame((40, 40, 40))
+    cv2.rectangle(frame, (300, 300), (400, 400), (0, 0, 220), -1)
+    cv2.rectangle(frame, (320, 220), (380, 290), (255, 255, 0), -1)  # BGR camgöbeği
+    balloon = Detection(300, 300, 400, 400, 0.9, config.BALLOON_CLASS_ID)
+    for _ in range(config.IFF_VOTE_MIN_FRAMES + 2):
+        label = clf.classify_balloon(frame, balloon, track_id=12)
+    assert label is IFFLabel.FRIEND
 
 
 # ---------------- takip / tekilleştirme ----------------

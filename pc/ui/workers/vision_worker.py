@@ -262,7 +262,13 @@ class VisionWorker(BaseWorker):
                 # Kalman tahmini — ölçüm yok, kutu ilerliyor
                 color = (180, 180, 220)
             elif is_balloon:
-                color = COLOR_BALLOON
+                # Aşama-3: balon IFF rengi (üstünde kırmızı=düşman, camgöbeği=dost)
+                if view.is_friendly is True:
+                    color = COLOR_FRIEND
+                elif view.is_friendly is False:
+                    color = COLOR_FOE
+                else:
+                    color = COLOR_BALLOON
             elif view.is_friendly is True:
                 color = COLOR_FRIEND
             elif view.is_friendly is False:
