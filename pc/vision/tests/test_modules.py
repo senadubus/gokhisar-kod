@@ -1,4 +1,5 @@
 """pytest ile otomatize testler (rapor: iteratif prototipleme + pytest)."""
+import cv2
 import numpy as np
 import pytest
 
@@ -18,7 +19,6 @@ def make_frame(color=(0, 0, 0)):
 
 
 def draw_circle(frame, center, r, bgr):
-    import cv2
     cv2.circle(frame, center, r, bgr, -1)
     return frame
 
@@ -76,6 +76,36 @@ def test_iff_stage2_all_foe():
     assert clf.classify(make_frame(), det, track_id=5) is IFFLabel.FOE
 
 
+def test_iff_balloon_stage3_needs_red_marker_on_top():
+    """Aşama-3: yalnız üstünde kırmızı nesne olan balon düşman."""
+    clf = FriendFoeClassifier(stage=3)
+    frame = make_frame((40, 40, 40))
+    # Balon gövdesi kırmızı (altta) — tek başına düşman sayılmamalı
+    cv2.rectangle(frame, (300, 300), (400, 400), (0, 0, 220), -1)
+    balloon = Detection(300, 300, 400, 400, 0.9, config.BALLOON_CLASS_ID)
+    for _ in range(config.IFF_VOTE_MIN_FRAMES + 2):
+        label = clf.classify_balloon(frame, balloon, track_id=10)
+    assert label is IFFLabel.UNKNOWN
+
+    # Üste kırmızı maket/işaret ekle → düşman
+    cv2.rectangle(frame, (320, 220), (380, 290), (0, 0, 255), -1)
+    clf2 = FriendFoeClassifier(stage=3)
+    for _ in range(config.IFF_VOTE_MIN_FRAMES + 2):
+        label = clf2.classify_balloon(frame, balloon, track_id=11)
+    assert label is IFFLabel.FOE
+
+
+def test_iff_balloon_stage3_cyan_marker_is_friend():
+    clf = FriendFoeClassifier(stage=3)
+    frame = make_frame((40, 40, 40))
+    cv2.rectangle(frame, (300, 300), (400, 400), (0, 0, 220), -1)
+    cv2.rectangle(frame, (320, 220), (380, 290), (255, 255, 0), -1)  # BGR camgöbeği
+    balloon = Detection(300, 300, 400, 400, 0.9, config.BALLOON_CLASS_ID)
+    for _ in range(config.IFF_VOTE_MIN_FRAMES + 2):
+        label = clf.classify_balloon(frame, balloon, track_id=12)
+    assert label is IFFLabel.FRIEND
+
+
 # ---------------- takip / tekilleştirme ----------------
 def _iou(a: Detection, b: Detection) -> float:
     ix1, iy1 = max(a.x1, b.x1), max(a.y1, b.y1)
@@ -127,15 +157,16 @@ def test_dedupe_keeps_different_classes_with_overlap():
 
 
 def test_tracker_suppresses_overlapping_same_class_tracks():
-    """ByteTrack çıktısındaki çift kimlik tekilleştirilmeli."""
+    """Örtüşen çift kutu tek kararlı iz olmalı."""
     tracker = TargetTracker()
     balloon = config.BALLOON_CLASS_ID
     dets = [
         Detection(500, 300, 600, 400, 0.71, balloon, source="yolo"),
         Detection(550, 300, 650, 400, 0.66, balloon, source="yolo"),
     ]
-    for _ in range(3):
-        active = tracker.update(dets)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    for _ in range(8):
+        active = tracker.update(dets, frame)
     assert len(active) == 1
 
 
@@ -147,9 +178,45 @@ def test_tracker_suppresses_phantom_background_tracks():
         Detection(400, 280, 520, 400, 0.66, balloon, source="yolo"),
         Detection(500, 200, 620, 320, 0.71, balloon, source="yolo"),
     ]
-    for _ in range(3):
-        active = tracker.update(dets)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    for _ in range(8):
+        active = tracker.update(dets, frame)
     assert len(active) == 1
+
+
+def test_tracker_reuses_id_after_low_conf_gap():
+    """Düşük conf kopunca yeni ham id gelse bile kararlı id korunmalı."""
+    tracker = TargetTracker()
+    balloon = config.BALLOON_CLASS_ID
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    strong = [Detection(200, 180, 280, 260, 0.85, balloon, source="yolo")]
+
+    for _ in range(5):
+        active = tracker.update(strong, frame)
+    assert len(active) == 1
+    stable_id = next(iter(active))
+
+    for _ in range(3):
+        active = tracker.update([], frame)
+    assert stable_id in active
+    assert active[stable_id].misses >= 1
+
+    for _ in range(5):
+        active = tracker.update(strong, frame)
+    assert stable_id in active
+    assert len(active) == 1
+
+
+def test_tracker_needs_confirm_frames_before_new_id():
+    """Tek karelik yüksek conf gürültü hemen yeni #id açmamalı."""
+    tracker = TargetTracker()
+    balloon = config.BALLOON_CLASS_ID
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    flash = [Detection(100, 100, 160, 160, 0.9, balloon, source="yolo")]
+    active = tracker.update(flash, frame)
+    assert len(active) == 0
+    active = tracker.update([], frame)
+    assert len(active) == 0
 
 
 # ---------------- imha değerlendirme (üç koşul) ----------------

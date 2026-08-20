@@ -14,7 +14,7 @@ Kare başına akış (KTR 4.2.2.1 – 4.2.2.10)::
       ├─ HSV küçük hedef tespiti             (4.2.2.1)
       ├─ dinamik ROI'de YOLO yeniden çıkarım (4.2.2.1)
       ├─ maket–balon eşleştirme              (4.2.2.2)
-      ├─ ByteTrack ile kimlik sürekliliği    (4.2.2.4)
+      ├─ BotSORT ile kimlik sürekliliği      (4.2.2.4)
       ├─ HSV + zamansal oylamalı IFF         (4.2.2.3)
       ├─ ağırlıklı öncelik puanı             (4.2.2.5)
       ├─ kilit toleransı denetimi            (4.2.2.6)
@@ -88,6 +88,20 @@ class TrackView:
 
 
 @dataclass
+class PairView:
+    """Doğrulanmış maket+balon ikilisi — birleşik çizim kutusu."""
+
+    bbox: tuple[float, float, float, float]
+    member_track_ids: tuple[int, ...]
+    display_name: str
+    confidence: float
+    iff: str
+    is_friendly: bool | None
+    is_candidate: bool = False
+    locked: bool = False
+
+
+@dataclass
 class PipelineResult:
     """Tek bir karenin boru hattı çıktısı."""
 
@@ -95,6 +109,7 @@ class PipelineResult:
     frame_height: int
     detections: list[Detection] = field(default_factory=list)
     tracks: list[TrackView] = field(default_factory=list)
+    pairs: list[PairView] = field(default_factory=list)
     candidate: TrackView | None = None
     locked: bool = False
     servo_target: tuple[float, float] | None = None
@@ -257,15 +272,17 @@ class VisionPipeline:
                 validated, _unmatched = self.matcher.match(frame, models, balloons)
 
         with self.latency.measure("tracking"):
-            tracked = self.tracker.update(detections)
+            tracked = self.tracker.update(detections, frame)
             self._accumulate_servo_corrections(tracked)
 
-        validated_ids = self._link_validated_to_tracks(validated, tracked)
+        validated_ids, balloon_markers = self._link_validated_to_tracks(
+            validated, tracked
+        )
         for track_id in validated_ids:
             self.lifecycle.on_validated(track_id)
 
         with self.latency.measure("iff_classification"):
-            self._run_iff(frame, tracked)
+            self._run_iff(frame, tracked, balloon_markers)
 
         with self.latency.measure("prioritization"):
             candidate = self._select_candidate(tracked)
@@ -276,6 +293,7 @@ class VisionPipeline:
         new_ids, lost_ids = self._sync_track_bookkeeping(tracked)
 
         views = self._build_track_views(tracked, candidate, locked)
+        pairs = self._build_pair_views(validated, tracked, views, candidate, locked)
         candidate_view = next(
             (v for v in views if candidate is not None
              and v.track_id == candidate.track_id), None)
@@ -293,6 +311,7 @@ class VisionPipeline:
             frame_height=height,
             detections=detections,
             tracks=views,
+            pairs=pairs,
             candidate=candidate_view,
             locked=locked,
             servo_target=servo_target,
@@ -371,7 +390,28 @@ class VisionPipeline:
                         roi = HsvBalloonDetector.dynamic_roi(balloon, frame.shape)
                         roi_dets.extend(self._remap(self.yolo.detect_in_roi(frame, roi)))
 
-        return self._dedupe(yolo_dets + roi_dets + hsv_dets), inference_ms
+        return self._filter_balloon_conf(
+            self._dedupe(yolo_dets + roi_dets + hsv_dets)
+        ), inference_ms
+
+    @staticmethod
+    def _filter_balloon_conf(detections: list[Detection]) -> list[Detection]:
+        """Zayıf / HSV uydurma balonları sil; maket sınıflarına dokunma.
+
+        HSV conf sabit yazıldığı için eşiği delmesin diye ``source=="hsv"``
+        adaylar her zaman elenir; yalnızca YOLO (ve ROI-YOLO) balonları kalır.
+        """
+        thr = float(getattr(vision_config, "BALLOON_CONF_THRESHOLD", 0.60))
+        kept: list[Detection] = []
+        for d in detections:
+            if d.class_id != BALLOON_CLASS_ID:
+                kept.append(d)
+                continue
+            if getattr(d, "source", "") == "hsv":
+                continue
+            if d.conf >= thr:
+                kept.append(d)
+        return kept
 
     def _balloons_needing_refine(
         self, balloons: list[Detection], models: list[Detection]
@@ -414,7 +454,7 @@ class VisionPipeline:
         """Aynı nesnenin farklı yollardan gelen kopyalarını tekilleştir.
 
         Tam kare YOLO ile ROI YOLO çoğu zaman aynı maketi iki kez üretir; ikisi
-        de takibe girerse ByteTrack aynı nesneye iki kimlik verir ve öncelik
+        de takibe girerse BotSORT aynı nesneye iki kimlik verir ve öncelik
         sıralaması bozulur. Güveni yüksek olan tutulur.
         """
         kept: list[Detection] = []
@@ -443,30 +483,56 @@ class VisionPipeline:
                 del target.servo_corrections[:-_SERVO_HISTORY_LEN]
 
     @staticmethod
-    def _link_validated_to_tracks(validated, tracked: dict[int, TrackedTarget]) -> set[int]:
-        """Doğrulanmış maketleri takip kimlikleriyle ilişkilendir.
+    def _link_validated_to_tracks(
+        validated, tracked: dict[int, TrackedTarget]
+    ) -> tuple[set[int], dict[int, Detection]]:
+        """Doğrulanmış maket–balon çiftlerini takip kimlikleriyle ilişkilendir.
 
-        `TargetMatcher` takipten önceki ham tespitlerle çalışır ve takip kimliği
-        bilmez; ByteTrack ise kutuyu Kalman tahminiyle bir miktar oynatır. İki
-        taraf en yüksek örtüşmeye göre eşleştirilir.
+        Dönüş: (doğrulanan track id'leri, balon_track_id → maket Detection).
+        Aşama-3'te balon IFF, balon gövdesine değil bu maket kutusuna bakar.
         """
         matched: set[int] = set()
+        balloon_markers: dict[int, Detection] = {}
         for operational in validated:
-            best_id, best_iou = None, _VALIDATION_IOU
+            best_model, best_model_iou = None, _VALIDATION_IOU
+            best_balloon, best_balloon_iou = None, _VALIDATION_IOU
             for track_id, target in tracked.items():
-                if target.det.class_id not in MODEL_CLASS_IDS:
-                    continue
-                score = _iou(target.det, operational.model_det)
-                if score > best_iou:
-                    best_id, best_iou = track_id, score
-            if best_id is not None:
-                matched.add(best_id)
-        return matched
+                if target.det.class_id in MODEL_CLASS_IDS:
+                    score = _iou(target.det, operational.model_det)
+                    if score > best_model_iou:
+                        best_model, best_model_iou = track_id, score
+                elif target.det.class_id == BALLOON_CLASS_ID:
+                    score = _iou(target.det, operational.balloon_det)
+                    if score > best_balloon_iou:
+                        best_balloon, best_balloon_iou = track_id, score
+            if best_model is not None:
+                matched.add(best_model)
+            if best_balloon is not None:
+                matched.add(best_balloon)
+                balloon_markers[best_balloon] = operational.model_det
+        return matched, balloon_markers
 
-    def _run_iff(self, frame: np.ndarray, tracked: dict[int, TrackedTarget]) -> None:
-        """Dost-düşman sınıflandırmasını çalıştır (balonlar hedef değildir)."""
+    def _run_iff(
+        self,
+        frame: np.ndarray,
+        tracked: dict[int, TrackedTarget],
+        balloon_markers: dict[int, Detection] | None = None,
+    ) -> None:
+        """Dost-düşman sınıflandırması.
+
+        Maket: kutu rengi. Balon (aşama-3): yalnız üstündeki kırmızı/camgöbeği
+        nesne; gövde kırmızısı düşman sayılmaz. Aşama-2: balonlar düşman.
+        """
+        markers = balloon_markers or {}
         for track_id, target in tracked.items():
             if target.det.class_id == BALLOON_CLASS_ID:
+                label = self.iff.classify_balloon(
+                    frame,
+                    target.det,
+                    track_id,
+                    marker_det=markers.get(track_id),
+                )
+                self.lifecycle.on_iff(track_id, label)
                 continue
             label = self.iff.classify(frame, target.det, track_id)
             self.lifecycle.on_iff(track_id, label)
@@ -474,8 +540,8 @@ class VisionPipeline:
     def _select_candidate(self, tracked: dict[int, TrackedTarget]) -> TrackedTarget | None:
         """Angajman / takip adayını seç.
 
-        Balon-only modelde maket+IFF yok; balonlar doğrudan takip adayı olur
-        (servo merkeze götürsün). Ateş kararı ayrı kapılarda kalır.
+        Aşama-3'te balon yalnız IFF=DÜŞMAN ise aday olur (üstünde kırmızı
+        nesne). Aşama-2'de balonlar düşman kabul edilir.
         """
         # Test/KTR: kısa miss'te Kalman tahmini varken adayı hemen bırakma
         max_miss = int(getattr(vision_config, "TRACK_CANDIDATE_MAX_MISSES", 5))
@@ -487,14 +553,15 @@ class VisionPipeline:
                 if target.misses > max_miss:
                     continue
                 rec = self.lifecycle.get(track_id)
-                # Matcher/IFF balonu atladığı için yaşam döngüsünü burada ilerlet.
                 if rec.state is TargetState.DETECT:
                     rec.state = TargetState.TRACK
+                # Aşama-2: IFF zaten FOE yazar. Aşama-3: hardcode yok.
+                if rec.iff is not IFFLabel.FOE:
+                    continue
                 if rec.state is TargetState.TRACK:
-                    rec.iff = IFFLabel.FOE
                     rec.state = TargetState.EVALUATE
                 if rec.state in (TargetState.EVALUATE, TargetState.TARGET_LOCK):
-                    candidates_input.append((target, IFFLabel.FOE))
+                    candidates_input.append((target, rec.iff))
                 continue
 
             # Kayıp maket izini kilit adayı yapma (Sena)
@@ -616,3 +683,86 @@ class VisionPipeline:
             ))
         views.sort(key=lambda v: v.priority, reverse=True)
         return views
+
+    def _build_pair_views(
+        self,
+        validated,
+        tracked: dict[int, TrackedTarget],
+        views: list[TrackView],
+        candidate: TrackedTarget | None,
+        locked: bool,
+    ) -> list[PairView]:
+        """Maket+balon ikilileri için birleşik kutu (aşama 2/3 çizimi)."""
+        if self.stage not in (2, 3) or not validated:
+            return []
+
+        view_by_id = {v.track_id: v for v in views}
+        candidate_id = candidate.track_id if candidate else None
+        pairs: list[PairView] = []
+
+        for operational in validated:
+            model_tid = self._best_track_id(
+                tracked, operational.model_det, MODEL_CLASS_IDS
+            )
+            balloon_tid = self._best_track_id(
+                tracked, operational.balloon_det, {BALLOON_CLASS_ID}
+            )
+            members = tuple(
+                tid for tid in (model_tid, balloon_tid) if tid is not None
+            )
+            x1 = min(operational.model_det.x1, operational.balloon_det.x1)
+            y1 = min(operational.model_det.y1, operational.balloon_det.y1)
+            x2 = max(operational.model_det.x2, operational.balloon_det.x2)
+            y2 = max(operational.model_det.y2, operational.balloon_det.y2)
+
+            # IFF / aday: maket izi öncelikli, yoksa balon
+            primary = None
+            for tid in (model_tid, balloon_tid):
+                if tid is not None and tid in view_by_id:
+                    primary = view_by_id[tid]
+                    break
+            model_name = self.class_map.display_name_for_config_id(
+                operational.model_det.class_id
+            )
+            label = f"{model_name}+Balon"
+            if primary is not None:
+                if primary.locked or (locked and candidate_id in members):
+                    label = f"{label} [KİLİT]"
+                elif primary.is_candidate or candidate_id in members:
+                    label = f"{label} [ADAY]"
+                iff_txt = primary.iff
+                is_friendly = primary.is_friendly
+            else:
+                iff_txt = IFF_LABEL_TEXT[IFFLabel.UNKNOWN]
+                is_friendly = None
+
+            conf = max(
+                float(operational.model_det.conf),
+                float(operational.balloon_det.conf),
+            )
+            pairs.append(PairView(
+                bbox=(x1, y1, x2, y2),
+                member_track_ids=members,
+                display_name=label,
+                confidence=conf,
+                iff=iff_txt,
+                is_friendly=is_friendly,
+                is_candidate=bool(candidate_id in members) if candidate_id else False,
+                locked=bool(locked and candidate_id in members) if candidate_id else False,
+            ))
+        return pairs
+
+    @staticmethod
+    def _best_track_id(
+        tracked: dict[int, TrackedTarget],
+        det: Detection,
+        class_ids: set[int],
+    ) -> int | None:
+        best_id, best_iou = None, _VALIDATION_IOU
+        for track_id, target in tracked.items():
+            if target.det.class_id not in class_ids:
+                continue
+            score = _iou(target.det, det)
+            if score > best_iou:
+                best_id, best_iou = track_id, score
+        return best_id
