@@ -127,15 +127,16 @@ def test_dedupe_keeps_different_classes_with_overlap():
 
 
 def test_tracker_suppresses_overlapping_same_class_tracks():
-    """ByteTrack çıktısındaki çift kimlik tekilleştirilmeli."""
+    """Örtüşen çift kutu tek kararlı iz olmalı."""
     tracker = TargetTracker()
     balloon = config.BALLOON_CLASS_ID
     dets = [
         Detection(500, 300, 600, 400, 0.71, balloon, source="yolo"),
         Detection(550, 300, 650, 400, 0.66, balloon, source="yolo"),
     ]
-    for _ in range(3):
-        active = tracker.update(dets)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    for _ in range(8):
+        active = tracker.update(dets, frame)
     assert len(active) == 1
 
 
@@ -147,9 +148,45 @@ def test_tracker_suppresses_phantom_background_tracks():
         Detection(400, 280, 520, 400, 0.66, balloon, source="yolo"),
         Detection(500, 200, 620, 320, 0.71, balloon, source="yolo"),
     ]
-    for _ in range(3):
-        active = tracker.update(dets)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    for _ in range(8):
+        active = tracker.update(dets, frame)
     assert len(active) == 1
+
+
+def test_tracker_reuses_id_after_low_conf_gap():
+    """Düşük conf kopunca yeni ham id gelse bile kararlı id korunmalı."""
+    tracker = TargetTracker()
+    balloon = config.BALLOON_CLASS_ID
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    strong = [Detection(200, 180, 280, 260, 0.85, balloon, source="yolo")]
+
+    for _ in range(5):
+        active = tracker.update(strong, frame)
+    assert len(active) == 1
+    stable_id = next(iter(active))
+
+    for _ in range(3):
+        active = tracker.update([], frame)
+    assert stable_id in active
+    assert active[stable_id].misses >= 1
+
+    for _ in range(5):
+        active = tracker.update(strong, frame)
+    assert stable_id in active
+    assert len(active) == 1
+
+
+def test_tracker_needs_confirm_frames_before_new_id():
+    """Tek karelik yüksek conf gürültü hemen yeni #id açmamalı."""
+    tracker = TargetTracker()
+    balloon = config.BALLOON_CLASS_ID
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    flash = [Detection(100, 100, 160, 160, 0.9, balloon, source="yolo")]
+    active = tracker.update(flash, frame)
+    assert len(active) == 0
+    active = tracker.update([], frame)
+    assert len(active) == 0
 
 
 # ---------------- imha değerlendirme (üç koşul) ----------------

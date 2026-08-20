@@ -1,9 +1,6 @@
 # Core Vision & AI Deep Learning
 ultralytics>=8.2.0
 
-# Multi-Object Tracking & Evaluation
-supervision>=0.20.0
-
 # Image Processing & Computer Vision
 opencv-python>=4.8.0
 numpy>=1.24.0

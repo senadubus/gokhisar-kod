@@ -14,7 +14,7 @@ Kare başına akış (KTR 4.2.2.1 – 4.2.2.10)::
       ├─ HSV küçük hedef tespiti             (4.2.2.1)
       ├─ dinamik ROI'de YOLO yeniden çıkarım (4.2.2.1)
       ├─ maket–balon eşleştirme              (4.2.2.2)
-      ├─ ByteTrack ile kimlik sürekliliği    (4.2.2.4)
+      ├─ BotSORT ile kimlik sürekliliği      (4.2.2.4)
       ├─ HSV + zamansal oylamalı IFF         (4.2.2.3)
       ├─ ağırlıklı öncelik puanı             (4.2.2.5)
       ├─ kilit toleransı denetimi            (4.2.2.6)
@@ -257,7 +257,7 @@ class VisionPipeline:
                 validated, _unmatched = self.matcher.match(frame, models, balloons)
 
         with self.latency.measure("tracking"):
-            tracked = self.tracker.update(detections)
+            tracked = self.tracker.update(detections, frame)
             self._accumulate_servo_corrections(tracked)
 
         validated_ids = self._link_validated_to_tracks(validated, tracked)
@@ -371,7 +371,18 @@ class VisionPipeline:
                         roi = HsvBalloonDetector.dynamic_roi(balloon, frame.shape)
                         roi_dets.extend(self._remap(self.yolo.detect_in_roi(frame, roi)))
 
-        return self._dedupe(yolo_dets + roi_dets + hsv_dets), inference_ms
+        return self._filter_balloon_conf(
+            self._dedupe(yolo_dets + roi_dets + hsv_dets)
+        ), inference_ms
+
+    @staticmethod
+    def _filter_balloon_conf(detections: list[Detection]) -> list[Detection]:
+        """Balon conf < BALLOON_CONF_THRESHOLD olanları sil; diğer sınıflara dokunma."""
+        thr = float(getattr(vision_config, "BALLOON_CONF_THRESHOLD", 0.60))
+        return [
+            d for d in detections
+            if d.class_id != BALLOON_CLASS_ID or d.conf >= thr
+        ]
 
     def _balloons_needing_refine(
         self, balloons: list[Detection], models: list[Detection]
@@ -414,7 +425,7 @@ class VisionPipeline:
         """Aynı nesnenin farklı yollardan gelen kopyalarını tekilleştir.
 
         Tam kare YOLO ile ROI YOLO çoğu zaman aynı maketi iki kez üretir; ikisi
-        de takibe girerse ByteTrack aynı nesneye iki kimlik verir ve öncelik
+        de takibe girerse BotSORT aynı nesneye iki kimlik verir ve öncelik
         sıralaması bozulur. Güveni yüksek olan tutulur.
         """
         kept: list[Detection] = []
@@ -447,7 +458,7 @@ class VisionPipeline:
         """Doğrulanmış maketleri takip kimlikleriyle ilişkilendir.
 
         `TargetMatcher` takipten önceki ham tespitlerle çalışır ve takip kimliği
-        bilmez; ByteTrack ise kutuyu Kalman tahminiyle bir miktar oynatır. İki
+        bilmez; BotSORT ise kutuyu Kalman tahminiyle bir miktar oynatır. İki
         taraf en yüksek örtüşmeye göre eşleştirilir.
         """
         matched: set[int] = set()

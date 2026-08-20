@@ -1,25 +1,23 @@
-"""Hedef Takip Modülü — ByteTrack + KTR Kalman gelecek tahmini.
+"""Hedef Takip Modülü — BotSORT motion + kararlı kendi ID + KTR Kalman.
 
 KTR 4.2.2.4:
-  • ByteTrack: IoU + Macar; yüksek güven önce, düşük güven telafi turu
-  • Ölçüm yokken yalnız tahmin adımı (predict)
-  • ByteTrack'ten bağımsız ikinci Kalman: merkez konumunu yumuşatır /
-    kısa kayıpta gelecek konumu tahmin eder (ServoKalman + per-track)
+  • BotSORT: hareket / düşük-conf telafi (ham track_id kullanılmaz)
+  • Kararlı #id: IoU+merkez eşleme; yeni id için conf + ardışık onay
+  • Ölçüm yokken TrackKalman predict (coast)
+  • ServoKalman ayrı (nişan)
 
 Akış:
-  tespitler → ByteTrack (kimlik) → her iz için TrackKalman
-  ölçüm var  → predict+correct → filtrelenmiş kutu
-  ölçüm yok  → predict_only   → kutu hızla ilerler (donmuş hayalet yok)
+  tespitler (+ kare) → BotSORT (kutu) → uzaysal ID eşleme → TrackKalman
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
-# pyrefly: ignore [missing-import]
-import supervision as sv
+from ultralytics.trackers.bot_sort import BOTSORT
 
 import config
 from detection.yolo_detector import Detection
@@ -102,6 +100,32 @@ def _detection_at_center(
     )
 
 
+class _DetBatch:
+    """Ultralytics BotSORT'un beklediği Results-benzeri tespit paketi."""
+
+    __slots__ = ("_xyxy", "conf", "cls")
+
+    def __init__(self, xyxy: np.ndarray, conf: np.ndarray, cls: np.ndarray) -> None:
+        self._xyxy = np.asarray(xyxy, dtype=np.float32).reshape(-1, 4)
+        self.conf = np.asarray(conf, dtype=np.float32).reshape(-1)
+        self.cls = np.asarray(cls, dtype=np.float32).reshape(-1)
+
+    @property
+    def xyxy(self) -> np.ndarray:
+        return self._xyxy
+
+    @property
+    def xywh(self) -> np.ndarray:
+        x1, y1, x2, y2 = self._xyxy.T
+        return np.stack([(x1 + x2) / 2.0, (y1 + y2) / 2.0, x2 - x1, y2 - y1], axis=1)
+
+    def __len__(self) -> int:
+        return int(self.conf.shape[0])
+
+    def __getitem__(self, idx) -> _DetBatch:
+        return _DetBatch(self._xyxy[idx], self.conf[idx], self.cls[idx])
+
+
 class TrackKalman:
     """Sabit-hız Kalman — merkez (cx, cy) + hız (vx, vy).
 
@@ -163,44 +187,198 @@ class TrackedTarget:
     predicted: bool = False      # bu karede kutu Kalman tahmini mi?
 
 
+def _botsort_args(fps: int = 30) -> SimpleNamespace:
+    """Config → Ultralytics BotSORT argümanları.
+
+    match_thresh maliyet eşiğidir (1 − IoU); TRACK_MATCH_IOU IoU alt sınırına
+    çevrilir. new_track_thresh ayrı ve yüksek tutulur: düşük conf gürültü
+    yalnızca mevcut izi besler, yeni ID açmaz. ReID kapalı.
+    """
+    iou_min = float(getattr(config, "TRACK_MATCH_IOU", 0.25))
+    new_track = float(
+        getattr(config, "TRACK_NEW_TRACK_CONF", config.TRACK_HIGH_CONF)
+    )
+    return SimpleNamespace(
+        tracker_type="botsort",
+        track_high_thresh=float(config.TRACK_HIGH_CONF),
+        track_low_thresh=float(config.TRACK_LOW_CONF),
+        new_track_thresh=new_track,
+        track_buffer=int(config.TRACK_BUFFER),
+        match_thresh=max(0.1, min(0.99, 1.0 - iou_min)),
+        fuse_score=True,
+        gmc_method=str(getattr(config, "TRACK_GMC_METHOD", "sparseOptFlow")),
+        proximity_thresh=float(getattr(config, "TRACK_PROXIMITY_THRESH", 0.5)),
+        appearance_thresh=float(getattr(config, "TRACK_APPEARANCE_THRESH", 0.8)),
+        with_reid=bool(getattr(config, "TRACK_WITH_REID", False)),
+        model="auto",
+        frame_rate=max(1, int(fps)),
+    )
+
+
+@dataclass
+class _LostSlot:
+    """Düşen iz — aynı konumda yeni tespit gelince eski #id'yi geri ver."""
+    track_id: int
+    box: np.ndarray
+    class_id: int
+    age_frames: int = 0
+
+
+@dataclass
+class _PendingNew:
+    """Yeni iz adayı — TRACK_CONFIRM_FRAMES dolmadan #id verilmez."""
+    box: np.ndarray
+    conf: float
+    class_id: int
+    hits: int = 1
+
+
 class TargetTracker:
     def __init__(self, fps: int = 30):
-        self.tracker = sv.ByteTrack(
-            track_activation_threshold=config.TRACK_HIGH_CONF,
-            minimum_matching_threshold=config.TRACK_MATCH_IOU,
-            lost_track_buffer=config.TRACK_BUFFER,
-            frame_rate=fps,
-            minimum_consecutive_frames=2,
-        )
+        self._fps = max(1, int(fps))
+        self.tracker = BOTSORT(_botsort_args(self._fps))
         self.targets: dict[int, TrackedTarget] = {}
         self._kalmans: dict[int, TrackKalman] = {}
+        self._next_id = 1
+        self._recent_lost: list[_LostSlot] = []
+        self._pending: list[_PendingNew] = []
 
     def set_fps(self, fps: int) -> None:
-        """Ölçülen pipeline FPS → ByteTrack zaman adımı (Sena track update)."""
-        if hasattr(self.tracker, "frame_rate"):
-            self.tracker.frame_rate = max(1, int(fps))
+        """Ölçülen pipeline FPS — tampon süresi sabit kare; yeniden kurma yok."""
+        self._fps = max(1, int(fps))
 
     def _kf(self, track_id: int) -> TrackKalman:
         if track_id not in self._kalmans:
             self._kalmans[track_id] = TrackKalman()
         return self._kalmans[track_id]
 
-    def _drop(self, track_id: int) -> None:
+    def _remember_lost(self, tid: int, t: TrackedTarget) -> None:
+        self._recent_lost.append(
+            _LostSlot(
+                track_id=tid,
+                box=np.asarray(t.det.as_xyxy(), dtype=np.float64),
+                class_id=t.det.class_id,
+                age_frames=0,
+            )
+        )
+
+    def _drop(self, track_id: int, *, remember: bool = True) -> None:
+        t = self.targets.get(track_id)
+        if remember and t is not None:
+            self._remember_lost(track_id, t)
         self.targets.pop(track_id, None)
         self._kalmans.pop(track_id, None)
+
+    def _prune_recent_lost(self) -> None:
+        limit = int(getattr(config, "TRACK_ID_REUSE_FRAMES", 120))
+        kept: list[_LostSlot] = []
+        for slot in self._recent_lost:
+            slot.age_frames += 1
+            if slot.age_frames <= limit and slot.track_id not in self.targets:
+                kept.append(slot)
+        self._recent_lost = kept
+
+    def _assoc_score(self, box: np.ndarray, other: np.ndarray) -> float:
+        """IoU + merkez yakınlığı; BotSORT id'sinden bağımsız yapıştırma skoru."""
+        iou_min = float(getattr(config, "TRACK_ASSOCIATE_IOU", 0.10))
+        center_ratio = float(
+            getattr(config, "TRACK_ASSOCIATE_CENTER", config.DEDUPE_CENTER_RATIO)
+        )
+        iou = _box_iou(box, other)
+        if iou >= iou_min:
+            return 1.0 + iou  # IoU eşleşmeleri öncelikli
+        if boxes_same_object(box, other, iou_threshold=iou_min, center_ratio=center_ratio):
+            dist = _box_center_dist(box, other)
+            max_side = max(
+                other[2] - other[0], other[3] - other[1],
+                box[2] - box[0], box[3] - box[1], 1.0,
+            )
+            return 0.5 + max(0.0, 1.0 - dist / (max_side * center_ratio))
+        return -1.0
+
+    def _match_existing(
+        self, box: np.ndarray, class_id: int, claimed: set[int]
+    ) -> int | None:
+        best_id, best = None, 0.0
+        for tid, t in self.targets.items():
+            if tid in claimed or t.det.class_id != class_id:
+                continue
+            score = self._assoc_score(box, t.det.as_xyxy())
+            if score > best:
+                best_id, best = tid, score
+        return best_id
+
+    def _match_lost(
+        self, box: np.ndarray, class_id: int, claimed: set[int]
+    ) -> int | None:
+        best_id, best = None, 0.0
+        for slot in self._recent_lost:
+            if slot.track_id in claimed or slot.class_id != class_id:
+                continue
+            if slot.track_id in self.targets:
+                continue
+            score = self._assoc_score(box, slot.box)
+            if score > best:
+                best_id, best = slot.track_id, score
+        if best_id is not None:
+            self._recent_lost = [
+                s for s in self._recent_lost if s.track_id != best_id
+            ]
+        return best_id
+
+    def _mint_id(self) -> int:
+        tid = self._next_id
+        self._next_id += 1
+        return tid
+
+    def _update_pending(
+        self, unmatched: list[tuple[np.ndarray, float, int]]
+    ) -> list[tuple[int, np.ndarray, float, int]]:
+        """Onaysız adayları güncelle; eşiği geçenleri yeni kararlı id olarak döndür."""
+        confirm = int(getattr(config, "TRACK_CONFIRM_FRAMES", 4))
+        new_conf = float(getattr(config, "TRACK_NEW_TRACK_CONF", 0.55))
+        promoted: list[tuple[int, np.ndarray, float, int]] = []
+        next_pending: list[_PendingNew] = []
+
+        for box, conf, cls_id in unmatched:
+            if conf < new_conf:
+                continue
+            best_i, best = -1, 0.0
+            for i, pend in enumerate(self._pending):
+                if pend.class_id != cls_id:
+                    continue
+                score = self._assoc_score(box, pend.box)
+                if score > best:
+                    best_i, best = i, score
+            if best_i >= 0:
+                pend = self._pending.pop(best_i)
+                pend.box = box
+                pend.conf = conf
+                pend.hits += 1
+                if pend.hits >= confirm:
+                    tid = self._match_lost(box, cls_id, set()) or self._mint_id()
+                    promoted.append((tid, box, conf, cls_id))
+                else:
+                    next_pending.append(pend)
+            else:
+                next_pending.append(
+                    _PendingNew(box=box, conf=conf, class_id=cls_id, hits=1)
+                )
+
+        self._pending = next_pending
+        return promoted
 
     def _coast_missing(self, tid: int) -> None:
         """Ölçüm yok: Kalman predict + kutuyu ilerlet (hayalet donmasın)."""
         t = self.targets[tid]
         t.misses += 1
         if t.misses > config.TRACK_BUFFER:
-            self._drop(tid)
+            self._drop(tid, remember=True)
             return
         kf = self._kf(tid)
         if not kf.initialized:
             return
         cx, cy = kf.predict_only()
-        # Güveni hafif düşür — tahmin olduğunu ayırt etmek için
         conf = max(0.05, t.det.conf * 0.92)
         t.det = _detection_at_center(t.det, cx, cy, conf=conf)
         t.predicted = True
@@ -209,99 +387,157 @@ class TargetTracker:
             t.center_history.pop(0)
 
     @staticmethod
-    def _suppress_overlapping(tracked: sv.Detections) -> sv.Detections:
+    def _suppress_overlapping(tracks: np.ndarray) -> np.ndarray:
         """Aynı sınıfta yüksek örtüşen takiplerden yalnızca en güvenilir olanı bırak."""
-        n = len(tracked)
+        if tracks.size == 0:
+            return tracks
+        n = tracks.shape[0]
         if n <= 1:
-            return tracked
+            return tracks
 
-        order = sorted(
-            range(n), key=lambda i: _as_float(tracked.confidence[i]), reverse=True
-        )
+        order = sorted(range(n), key=lambda i: float(tracks[i, 5]), reverse=True)
         keep: list[int] = []
         for i in order:
-            cls_i = _as_int(tracked.class_id[i])
-            box_i = tracked.xyxy[i]
+            cls_i = int(tracks[i, 6])
+            box_i = tracks[i, :4]
             if any(
-                _as_int(tracked.class_id[j]) == cls_i
+                int(tracks[j, 6]) == cls_i
                 and boxes_same_object(
-                    box_i, tracked.xyxy[j], iou_threshold=config.TRACK_DEDUPE_IOU
+                    box_i, tracks[j, :4], iou_threshold=config.TRACK_DEDUPE_IOU
                 )
                 for j in keep
             ):
                 continue
             keep.append(i)
-        return tracked[keep]
+        return tracks[keep]
 
     @staticmethod
-    def _to_sv(detections: list[Detection]) -> sv.Detections:
-        """Birleşik tespit listesi -> supervision formatı."""
-        valid_dets = [d for d in detections if d.conf >= config.TRACK_LOW_CONF]
-        if not valid_dets:
-            return sv.Detections.empty()
-        return sv.Detections(
-            xyxy=np.array([d.as_xyxy() for d in valid_dets]),
-            confidence=np.array([d.conf for d in valid_dets]),
-            class_id=np.array([d.class_id for d in valid_dets]),
+    def _to_batch(detections: list[Detection]) -> _DetBatch:
+        """Birleşik tespit listesi → BotSORT giriş formatı."""
+        valid = [d for d in detections if d.conf >= config.TRACK_LOW_CONF]
+        if not valid:
+            return _DetBatch(
+                np.zeros((0, 4), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+            )
+        return _DetBatch(
+            np.array([d.as_xyxy() for d in valid], dtype=np.float32),
+            np.array([d.conf for d in valid], dtype=np.float32),
+            np.array([d.class_id for d in valid], dtype=np.float32),
         )
 
-    def update(self, detections: list[Detection]) -> dict[int, TrackedTarget]:
-        """ByteTrack kimlik + TrackKalman konum (ölçüm / tahmin)."""
-        tracked = self.tracker.update_with_detections(self._to_sv(detections))
-        if len(tracked) == 0 or tracked.tracker_id is None:
+    def _apply_measurement(
+        self, tid: int, box: np.ndarray, conf: float, cls_id: int
+    ) -> None:
+        x1, y1, x2, y2 = (float(v) for v in box[:4])
+        raw = Detection(
+            x1, y1, x2, y2, conf=conf, class_id=cls_id, source="track"
+        )
+        self._kf(tid).update(raw.cx, raw.cy)
+        if tid in self.targets:
+            t = self.targets[tid]
+            t.det = raw
+            t.age += 1
+            t.misses = 0
+            t.predicted = False
+            t.track_id = tid
+        else:
+            t = TrackedTarget(track_id=tid, det=raw, age=1, predicted=False)
+            self.targets[tid] = t
+        t.center_history.append((raw.cx, raw.cy))
+        if len(t.center_history) > 60:
+            t.center_history.pop(0)
+
+    def update(
+        self,
+        detections: list[Detection],
+        frame: np.ndarray | None = None,
+    ) -> dict[int, TrackedTarget]:
+        """BotSORT motion + kararlı kendi ID.
+
+        BotSORT'un ürettiği ham track_id kullanılmaz; kutular mevcut / kayıp
+        izlere IoU+merkez ile yapıştırılır. Yeni #id yalnız yüksek conf ve
+        ``TRACK_CONFIRM_FRAMES`` peş peşe adaylıktan sonra verilir.
+        """
+        self._prune_recent_lost()
+        batch = self._to_batch(detections)
+        tracked = self.tracker.update(batch, frame)
+
+        rows: list[tuple[np.ndarray, float, int]] = []
+        if tracked is not None and len(tracked) > 0:
+            arr = np.asarray(tracked, dtype=np.float32)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            arr = self._suppress_overlapping(arr)
+            for row in arr:
+                rows.append(
+                    (
+                        np.asarray(row[:4], dtype=np.float64),
+                        _as_float(row[5]),
+                        _as_int(row[6]),
+                    )
+                )
+
+        # BotSORT boş kaldıysa ham tespitlerle ID sürekliliğini koru
+        if not rows:
+            for det in detections:
+                if det.conf < config.TRACK_LOW_CONF:
+                    continue
+                rows.append(
+                    (
+                        np.asarray(det.as_xyxy(), dtype=np.float64),
+                        float(det.conf),
+                        int(det.class_id),
+                    )
+                )
+            # aynı sınıf örtüşen ham kutuları tekilleştir
+            rows.sort(key=lambda r: r[1], reverse=True)
+            kept: list[tuple[np.ndarray, float, int]] = []
+            for box, conf, cls_id in rows:
+                if any(
+                    c == cls_id
+                    and boxes_same_object(box, b, iou_threshold=config.TRACK_DEDUPE_IOU)
+                    for b, _, c in kept
+                ):
+                    continue
+                kept.append((box, conf, cls_id))
+            rows = kept
+
+        if not rows:
+            self._pending.clear()
             for tid in list(self.targets):
                 self._coast_missing(tid)
             return self.targets
 
-        tracked = self._suppress_overlapping(tracked)
-        if len(tracked) == 0 or tracked.tracker_id is None:
-            for tid in list(self.targets):
-                self._coast_missing(tid)
-            return self.targets
-
+        # Önce güçlü conf, sonra mevcut izlere yapıştır
+        rows.sort(key=lambda r: r[1], reverse=True)
         seen: set[int] = set()
-        for xyxy, conf, cls_id, tid in zip(
-            tracked.xyxy,
-            tracked.confidence,
-            tracked.class_id,
-            tracked.tracker_id,
-        ):
-            tid = _as_int(tid)
-            seen.add(tid)
-            x1, y1, x2, y2 = (float(v) for v in np.asarray(xyxy).reshape(-1)[:4])
-            raw = Detection(
-                x1,
-                y1,
-                x2,
-                y2,
-                conf=_as_float(conf),
-                class_id=_as_int(cls_id),
-                source="track",
-            )
-            # KF'yi sadece miss coast için besle. Ölçüm varken ham merkez kullan —
-            # filtrelenmiş kutu gecikince taret önce geçer, sonra geri gelir (üst→alt→orta).
-            self._kf(tid).update(raw.cx, raw.cy)
-            det = raw
-            fx, fy = raw.cx, raw.cy
+        claimed: set[int] = set()
+        unmatched: list[tuple[np.ndarray, float, int]] = []
 
-            if tid in self.targets:
-                t = self.targets[tid]
-                t.det = det
-                t.age += 1
-                t.misses = 0
-                t.predicted = False
+        for box, conf, cls_id in rows:
+            tid = self._match_existing(box, cls_id, claimed)
+            if tid is None:
+                tid = self._match_lost(box, cls_id, claimed)
+            if tid is not None:
+                claimed.add(tid)
+                seen.add(tid)
+                self._apply_measurement(tid, box, conf, cls_id)
             else:
-                t = TrackedTarget(track_id=tid, det=det, age=1, predicted=False)
-                self.targets[tid] = t
-            t.center_history.append((fx, fy))
-            if len(t.center_history) > 60:
-                t.center_history.pop(0)
+                unmatched.append((box, conf, cls_id))
+
+        for tid, box, conf, cls_id in self._update_pending(unmatched):
+            if tid in claimed:
+                continue
+            claimed.add(tid)
+            seen.add(tid)
+            self._apply_measurement(tid, box, conf, cls_id)
 
         for tid in list(self.targets):
             if tid in seen:
                 continue
             t = self.targets[tid]
-            # Çift iz: aktif ölçümlü örtüşen varsa düş
             if any(
                 other.det.class_id == t.det.class_id
                 and boxes_same_object(
@@ -312,7 +548,7 @@ class TargetTracker:
                 for other_id, other in self.targets.items()
                 if other_id in seen
             ):
-                self._drop(tid)
+                self._drop(tid, remember=False)
                 continue
             self._coast_missing(tid)
 

@@ -3,8 +3,10 @@
 # ---------------- YOLO ----------------
 YOLO_MODEL_PATH = "yolo_modeli.pt"   # eğitilmiş model
 YOLO_IMG_SIZE = 640                  # 480 küçük/uzak balonda kaçırma yapıyordu
-YOLO_CONF_THRESHOLD = 0.15          # balon modeli için 0.35 fazla katı kalabiliyor
+YOLO_CONF_THRESHOLD = 0.15          # model/maket için düşük tut; balon ayrı elenir
 YOLO_IOU_THRESHOLD = 0.45
+# Balon: conf < 0.60 tamamen atılır (takip/UI'ya girmez)
+BALLOON_CONF_THRESHOLD = 0.60
 
 
 CLASS_NAMES = {0: "fuze", 1: "helikopter", 2: "iha", 3: "ucak", 4: "balon"}
@@ -37,16 +39,28 @@ IFF_VOTE_MIN_FRAMES = 5       # düşman doğrulaması için asgari tutarlı kar
 HUE_RED_RANGES = [(0, 10), (170, 180)]
 HUE_CYAN_RANGE = (80, 130)
 
-# ---------------- Takip ----------------
-# Sena main (track/performance update) + bizim Kalman/home/servo ayarları
-TRACK_HIGH_CONF = 0.35
-TRACK_LOW_CONF = 0.1
-TRACK_BUFFER = 60             # ID sürekliliği (~0.7 sn @~60fps boru / ~2 sn @20fps)
-TRACK_MATCH_IOU = 0.35
-TRACK_DEDUPE_IOU = 0.30
-DEDUPE_IOU = 0.30
-DEDUPE_CENTER_RATIO = 1.1
-TRACK_MAX_DRAW_MISSES = 2     # UI: 2 kareye kadar coast/tahmin çiz
+# ---------------- Takip (BotSORT hareket + kararlı kendi ID) ----------------
+# BotSORT yalnız kutu/motion üretir; ekrandaki #id bizim sayacımızdır.
+# Düşük conf mevcut izi besler; yeni ID için yüksek conf + ardışık onay.
+TRACK_HIGH_CONF = 0.60
+TRACK_LOW_CONF = 0.60
+TRACK_NEW_TRACK_CONF = 0.60
+TRACK_CONFIRM_FRAMES = 3      # yeni ID vermeden önce peş peşe eşleşme
+TRACK_BUFFER = 90             # kısa conf düşüşünde ID'yi tut
+TRACK_MATCH_IOU = 0.15        # BotSORT iç eşleme (gevşek)
+TRACK_ASSOCIATE_IOU = 0.10    # bizim kararlı ID eşlemesi
+TRACK_ASSOCIATE_CENTER = 1.4  # kutu kenarına göre merkez yakınlığı
+TRACK_DEDUPE_IOU = 0.25
+DEDUPE_IOU = 0.25
+DEDUPE_CENTER_RATIO = 1.2
+TRACK_MAX_DRAW_MISSES = 3
+TRACK_ID_REUSE_IOU = 0.08
+TRACK_ID_REUSE_FRAMES = 120
+# sparseOptFlow taret/titreşimde yanlış warp → ID patlaması; kapalı
+TRACK_GMC_METHOD = "none"
+TRACK_WITH_REID = False
+TRACK_PROXIMITY_THRESH = 0.5
+TRACK_APPEARANCE_THRESH = 0.8
 
 # Per-track + servo Kalman — ölçüme daha çok güven (lag/osalasyon azalsın)
 TRACK_KALMAN_PROCESS = 2e-2

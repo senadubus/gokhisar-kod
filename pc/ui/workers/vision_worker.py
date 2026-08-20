@@ -166,7 +166,6 @@ class VisionWorker(BaseWorker):
         hints = {
             "ultralytics": "pip install 'ultralytics>=8.2,<9'",
             "torch": "pip install torch",
-            "supervision": "pip install 'supervision>=0.20'",
             "cv2": "pip install opencv-python",
             "filterpy": "pip install filterpy",
         }
@@ -250,7 +249,7 @@ class VisionWorker(BaseWorker):
         """`PipelineResult`'ı mevcut çizim katmanının anladığı biçime çevir.
 
         Çizilenler: takip edilen her hedef (IFF rengiyle) ve takip altına
-        girmemiş balonlar. Balonlar ByteTrack'in aktivasyon eşiğinin altında
+        girmemiş balonlar. Balonlar BotSORT'un aktivasyon eşiğinin altında
         kaldığı için hiçbir zaman iz üretmez; ama doğrulamanın neye baktığını
         operatörün görmesi gerekir.
         """
