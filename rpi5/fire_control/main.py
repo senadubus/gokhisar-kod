@@ -314,7 +314,10 @@ def run(args: argparse.Namespace) -> None:
 
             fire_intent = bool(snap.fire or snap.engage_active)
 
-            if stage <= 1 and snap.mode == "manuel":
+            # Engage / fire niyeti: merkez-LiDAR-IFF beklemeden tetik (test)
+            if snap.engage_active or snap.fire:
+                want_fire = bool(snap.enable)
+            elif stage <= 1 and snap.mode == "manuel":
                 want_fire = bool(fire_intent and snap.arm and snap.enable and allow_iff)
             elif stage == 2:
                 want_fire = bool(
@@ -348,7 +351,7 @@ def run(args: argparse.Namespace) -> None:
                     pan_deg=pan,
                     tilt_deg=tilt_cmd,
                     fire=want_fire,
-                    arm=snap.arm and allow_iff,
+                    arm=bool(snap.arm or snap.engage_active),
                     heartbeat=True,
                     home=home,
                     safe=False,

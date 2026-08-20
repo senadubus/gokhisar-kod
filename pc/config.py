@@ -73,6 +73,9 @@ SERVO_TARGET_MAX_JUMP_PX = 20.0
 # False: otonom 2./3. servo/PID açık.
 TRACKING_TEST_MODE = False
 
+# Kilit açılınca IFF/aday/merkez/LiDAR beklemeden ateş (test).
+FIRE_PERMISSIVE_WHEN_UNLOCKED = True
+
 # Servo home (gokhisar 0–180°). UI Elevation = tilt - 90 → -10° ⇒ tilt 80°.
 SERVO_PAN_HOME_DEG = 90.0
 SERVO_TILT_HOME_DEG = 80.0
