@@ -73,13 +73,14 @@ SERVO_TARGET_MAX_JUMP_PX = 20.0
 # False: otonom 2./3. servo/PID açık.
 TRACKING_TEST_MODE = False
 
-# Kilit açılınca IFF/aday/merkez/LiDAR beklemeden ateş (test).
-FIRE_PERMISSIVE_WHEN_UNLOCKED = True
-
 # Servo home (gokhisar 0–180°). UI Elevation = tilt - 90 → -10° ⇒ tilt 80°.
 SERVO_PAN_HOME_DEG = 90.0
 SERVO_TILT_HOME_DEG = 80.0
 SERVO_ELEVATION_HOME_UI = -10  # -15 fazla aşağıydı
+# True: nesne sağdayken taret sola gidiyorsa pan komutunu ayna (PC tarafı).
+# RPi --invert-x ile birlikte AÇMA — çift tersleme olur.
+SERVO_INVERT_PAN = True
+SERVO_INVERT_TILT = False
 
 # ---------------- Değerlendirme / Önceliklendirme (5 Ölçüt) ----------------
 W_SIZE = 0.35                  # hedef boyut ağırlığı

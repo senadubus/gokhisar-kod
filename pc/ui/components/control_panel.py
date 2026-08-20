@@ -301,7 +301,7 @@ class ControlPanel(QFrame):
 
         self.btn_fire = QPushButton("ATEŞ")
         self.btn_fire.setStyleSheet(Styles.BUTTON_DANGER)
-        self.btn_fire.setEnabled(True)  # manuel: basınca her türlü
+        self.btn_fire.setEnabled(False)
         self.btn_fire.setFixedHeight(52)
         self.btn_fire.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         L.addWidget(self.btn_fire)
@@ -375,23 +375,25 @@ class ControlPanel(QFrame):
     # ── Kilit / Ateş ──────────────────────────────────────────────────
     def _on_unlock_toggled(self, checked):
         if checked and self._emergency_active:
+            # Güvenli duruşta kilit açılamaz; programatik bir setChecked
+            # gelse bile burada geri alınır.
             self.btn_unlock.setChecked(False)
             return
         self._fire_unlocked = checked
         if checked:
             self.btn_unlock.setText("KİLİT AÇIK ✓")
             self.btn_unlock.setStyleSheet(Styles.BUTTON_SUCCESS)
+            if self._is_friendly_target is not True:
+                self.btn_fire.setEnabled(True)
         else:
             self.btn_unlock.setText("KİLİDİ AÇ")
             self.btn_unlock.setStyleSheet(Styles.BUTTON_NORMAL + "QPushButton{font-size:13px;font-weight:600;}")
-        # Manuel test: ATEŞ her zaman basılabilir
-        self.btn_fire.setEnabled(True)
-        self.btn_fire.setText("ATEŞ")
+            self.btn_fire.setEnabled(False)
 
     def _on_fire_clicked(self):
-        # Kilit / dost / emniyet bakmadan ATEŞ gönder
-        self.fire_command.emit()
+        if self._emergency_active or self._is_friendly_target is True: return
         if self._fire_unlocked:
+            self.fire_command.emit()
             self.btn_unlock.setChecked(False)
 
     # ── Dışarıdan ─────────────────────────────────────────────────────
@@ -424,10 +426,9 @@ class ControlPanel(QFrame):
             self.btn_unlock.setChecked(False)
             self.btn_unlock.setEnabled(False)
         else:
-            self.btn_unlock.setEnabled(True)
-        # Manuel: ATEŞ her zaman açık
-        self.btn_fire.setEnabled(True)
-        self.btn_fire.setText("ATEŞ")
+            self.btn_unlock.setEnabled(self._is_friendly_target is not True)
+        self.btn_fire.setEnabled(False)
+        self.btn_fire.setText(self._fire_idle_text())
 
     def _fire_idle_text(self) -> str:
         """ATEŞ düğmesinin boştaki etiketi: kilidin gerekçesini gösterir."""
@@ -440,9 +441,15 @@ class ControlPanel(QFrame):
     @Slot(bool)
     def set_friendly_target(self, friendly):
         self._is_friendly_target = friendly
-        self.btn_unlock.setEnabled(not self._emergency_active)
-        self.btn_fire.setEnabled(True)
-        self.btn_fire.setText("ATEŞ")
+        if friendly:
+            self.btn_fire.setEnabled(False)
+            self.btn_unlock.setEnabled(False)
+            self.btn_unlock.setChecked(False)
+        else:
+            self.btn_unlock.setEnabled(not self._emergency_active)
+            if self._fire_unlocked and not self._emergency_active:
+                self.btn_fire.setEnabled(True)
+        self.btn_fire.setText(self._fire_idle_text())
 
     @Slot()
     def clear_target_lock(self):

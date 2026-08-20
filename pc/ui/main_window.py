@@ -717,6 +717,13 @@ class MainWindow(QMainWindow):
         oy = float(getattr(config, "AIM_OFFSET_Y_PX", 0.0))
         cx = float(candidate.center[0]) + ox
         cy = float(candidate.center[1]) + oy
+        # Donanım pan/tilt yönü: görüntü ofsetini ayna et → RPi err işareti döner
+        fw = float(getattr(result, "frame_width", 0) or config.FRAME_WIDTH)
+        fh = float(getattr(result, "frame_height", 0) or config.FRAME_HEIGHT)
+        if bool(getattr(config, "SERVO_INVERT_PAN", False)):
+            cx = fw - cx
+        if bool(getattr(config, "SERVO_INVERT_TILT", False)):
+            cy = fh - cy
         t0 = time.perf_counter()
         self._rpi_worker.send_target(
             cx, cy, candidate.config_class_id, candidate.track_id, candidate.locked
@@ -735,8 +742,32 @@ class MainWindow(QMainWindow):
         )
 
     def _maybe_auto_engage(self, result, candidate):
-        """Otomatik angajman kapalı — yalnız ATEŞ düğmesi ateşler."""
-        return
+        """Kilitli düşman hedefte angajman talebini gönder.
+
+        Üç koruma katmanı var ve hepsi birlikte sağlanmalı:
+        1. Hedef kilidi (KTR 4.4.2) — boru hattı kilit koşullarını doğruladı.
+        2. IFF düşman kararı — dost ya da bilinmeyen hedefe ateş edilmez.
+        3. Operatörün ateş kilidini açmış olması — insan onayı devrede kalır.
+
+        Mesafe ve yasak açı bölgesi denetimi RPi'de yapılır; burada tekrar
+        edilmiyor çünkü LiDAR verisi orada, gecikmesiz.
+        """
+        if getattr(config, "TRACKING_TEST_MODE", False):
+            return
+        if not (result.locked and candidate.locked):
+            return
+        if candidate.is_friendly is not False:
+            return
+        if not self.control_panel.is_fire_unlocked:
+            return
+
+        now = time.monotonic()
+        if now - self._last_engage_time < self._settings.pipeline.engage_repeat_s:
+            return
+        self._last_engage_time = now
+        self._rpi_worker and self._rpi_worker.send_engage(
+            candidate.track_id, candidate.config_class_id
+        )
 
     def _log_track_events(self, result):
         """Yeni/kaybolan/imha edilen izleri göreve dönük mesajlara çevir."""
@@ -764,21 +795,41 @@ class MainWindow(QMainWindow):
     # ---------- Operatör komutları ----------
     @Slot()
     def _on_fire_command(self):
-        """Manuel ATEŞ — tek basış = tek engage (spam yok)."""
+        """Manuel ATEŞ düğmesi (iki adımlı güvenlik mekanizmasının ikinci adımı).
+
+        Atış kontrol tarafı (`rpi5/fire_control`) `engage` mesajını ARM+FIRE
+        niyeti olarak yorumluyor; Aşama-1'de (manuel görev) ek bir kilit/menzil
+        koşulu aramadığı için manuel ateş artık RPi'de de tamamlanıyor. Bu
+        yüzden eskiden buraya yazılan "manuel modda ateş çıkmaz" uyarısı
+        kaldırıldı — yanlış bilgi vermek, hiç bilgi vermemekten kötüdür.
+        """
         self.log_panel.log_warning("🔥 ATEŞ KOMUTU VERİLDİ!")
+        if (
+            getattr(config, "TRACKING_TEST_MODE", False)
+            and self._current_mode in ("ASAMA_2", "ASAMA_3")
+        ):
+            self.log_panel.log_warning(
+                "TRACKING TEST — otonom ateş RPi'ye gönderilmedi"
+            )
+            return
+        if self._system.state is SystemState.FAIL_SAFE:
+            self.log_panel.log_error("GÜVENLİ DURUŞ - ateş komutu reddedildi")
+            return
         if self._rpi_worker is None or not self._rpi_worker.isRunning():
             self.log_panel.log_error("RPi bağlantısı yok - Ateş komutu gönderilemedi!")
             return
-        now = time.monotonic()
-        if now - self._last_engage_time < 0.8:
-            self.log_panel.log_warning("Ateş soğuma — tekrar basma")
-            return
-        self._last_engage_time = now
+
         candidate = self._candidate
-        tid = int(candidate.track_id) if candidate is not None else -1
-        cid = int(candidate.config_class_id) if candidate is not None else -1
-        self._rpi_worker.send_engage(tid, cid)
-        self.log_panel.log_info(f"Engage kuyruğa alındı track={tid} class={cid}")
+        if candidate is None:
+            self.log_panel.log_error(
+                "Angajman adayı yok - ateş komutu gönderilmedi"
+            )
+            return
+        if candidate.is_friendly is True:
+            self.log_panel.log_error("DOST hedef - ateş komutu reddedildi")
+            return
+
+        self._rpi_worker.send_engage(candidate.track_id, candidate.config_class_id)
 
     @Slot(int, int)
     def _on_servo_command(self, x: int, y: int):
@@ -945,13 +996,11 @@ class MainWindow(QMainWindow):
     @Slot(int)
     def _on_engagement_sent(self, track_id: int):
         self._engaged_track_id = track_id
-        # Manuel tek atışta ANGAJMAN durumunda takılı kalmasın
-        if self._current_mode == "MANUEL":
-            self.log_panel.log_info(f"Manuel ATEŞ gönderildi #{track_id}")
-            return
         state = self._system.on_engagement()
         self.status_panel.set_system_state(state.value)
         self.log_panel.log_engagement_start(f"#{track_id}")
+        # RPi ateşleme bildirimi göndermiyorsa imha değerlendirmesi hiç
+        # başlamaz; angajman talebini de ateşleme anı sayıyoruz.
         if self._vision_worker:
             self._vision_worker.notify_fired(track_id)
 

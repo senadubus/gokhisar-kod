@@ -222,7 +222,9 @@ def run(args: argparse.Namespace) -> None:
 
             if snap.mode == "manuel":
                 dpan, dtilt = state.consume_manual_delta()
-                # Pan tersi PC SERVO_INVERT_PAN'da; burada tekrar çevirme
+                # Donanım yönü: --invert-x / --invert-y
+                if args.invert_x:
+                    dpan = -dpan
                 if args.invert_y:
                     dtilt = -dtilt
                 if dpan or dtilt:
@@ -254,9 +256,10 @@ def run(args: argparse.Namespace) -> None:
                     snap.track_id >= 0 or snap.class_id >= 0
                 )
                 if has_target or snap.engage_active:
-                    # Pan yönü PC SERVO_INVERT_PAN_AUTO ile ayarlanır — burada çevirme.
+                    # Donanım pan/tilt yönü CLI ile çevrilir.
+                    sx = -1.0 if args.invert_x else 1.0
                     sy = -1.0 if args.invert_y else 1.0
-                    dpan = pid_x.step(err_pan_deg, dt)
+                    dpan = sx * pid_x.step(err_pan_deg, dt)
                     dtilt = sy * pid_y.step(err_tilt_deg, dt)
                     pan += dpan
                     tilt += dtilt
@@ -314,10 +317,7 @@ def run(args: argparse.Namespace) -> None:
 
             fire_intent = bool(snap.fire or snap.engage_active)
 
-            # Engage / fire niyeti: merkez-LiDAR-IFF beklemeden tetik (test)
-            if snap.engage_active or snap.fire:
-                want_fire = bool(snap.enable)
-            elif stage <= 1 and snap.mode == "manuel":
+            if stage <= 1 and snap.mode == "manuel":
                 want_fire = bool(fire_intent and snap.arm and snap.enable and allow_iff)
             elif stage == 2:
                 want_fire = bool(
@@ -351,7 +351,7 @@ def run(args: argparse.Namespace) -> None:
                     pan_deg=pan,
                     tilt_deg=tilt_cmd,
                     fire=want_fire,
-                    arm=bool(snap.arm or snap.engage_active),
+                    arm=snap.arm and allow_iff,
                     heartbeat=True,
                     home=home,
                     safe=False,
@@ -457,14 +457,14 @@ def main() -> None:
         default=None,
         help="cos: Kg*cos(elev); const: sabit Kg",
     )
-    # Donanım pan tersi artık PC'de SERVO_INVERT_PAN ile yapılıyor.
-    # Çift terslememek için RPi varsayılanı kapalı.
+    # Yatay/dikey donanım yönü. Pan tersi tercihen PC SERVO_INVERT_PAN.
+    # İkisini birden açma. Varsayılan kapalı (PC aynalıyor).
     p.add_argument(
         "--invert-x",
         dest="invert_x",
         action="store_true",
         default=False,
-        help="Yatay (pan) yönünü RPi'de ters çevir (PC invert varsa kullanma)",
+        help="Yatay (pan) PID/manuel yönünü RPi'de ters çevir (PC invert açıksa kullanma)",
     )
     p.add_argument(
         "--no-invert-x",
@@ -472,7 +472,7 @@ def main() -> None:
         action="store_false",
         help="Yatay invert'i kapat",
     )
-    p.add_argument("--invert-y", action="store_true")
+    p.add_argument("--invert-y", action="store_true", help="Dikey (tilt) yönünü ters çevir")
     p.add_argument(
         "--video-host",
         default="",
