@@ -43,6 +43,10 @@ COLOR_FOE = (235, 60, 60)         # DÜŞMAN — kırmızı
 COLOR_UNKNOWN = (240, 200, 60)    # BİLİNMİYOR — sarı
 COLOR_BALLOON = (235, 120, 200)   # Balon (angajman hedefi değil) — pembe
 COLOR_LOCKED = (255, 255, 255)    # Kilitli hedef — beyaz, dikkat çekici
+COLOR_PAIR_MEMBER = (210, 210, 210)  # İkili içindeki tekil kutu — silik, beyaza yakın
+COLOR_PAIR_UNION_FOE = (235, 40, 40)    # Düşman ikili — kırmızı
+COLOR_PAIR_UNION_FRIEND = (60, 220, 90) # Dost ikili — yeşil
+COLOR_PAIR_UNION = (235, 40, 40)        # IFF belirsiz ikili — kırmızı varsayılan
 
 
 class VisionWorker(BaseWorker):
@@ -248,21 +252,29 @@ class VisionWorker(BaseWorker):
     def _to_detection_frame(self, result, *, queue_ms: float = 0.0) -> DetectionFrame:
         """`PipelineResult`'ı mevcut çizim katmanının anladığı biçime çevir.
 
-        Çizilenler: yalnız takip edilen hedefler (IFF rengiyle). Takibe
-        girmemiş ham balon kutuları çizilmez — HSV/YOLO gürültüsü ekranı
-        doldurmasın; operatör zaten track etiketinden görür.
+        Aşama 2/3: doğrulanmış maket+balon ikililerinde tekil kutular gri,
+        ikisini saran birleşik kutu kırmızı. Diğer izler IFF rengiyle kalır.
         """
         drawables: list[Detection] = []
+        stage = int(getattr(result, "stage", 3) or 3)
+        pairs = list(getattr(result, "pairs", None) or [])
+        pair_member_ids: set[int] = set()
+        if stage in (2, 3):
+            for pair in pairs:
+                pair_member_ids.update(pair.member_track_ids)
 
         for view in result.tracks:
             is_balloon = view.config_class_id == BALLOON_CLASS_ID
-            if view.locked:
+            in_pair = view.track_id in pair_member_ids
+
+            if stage in (2, 3) and in_pair and not view.locked:
+                # Tekil maket/balon — gri; birleşik kırmızı kutu asıl işaret
+                color = COLOR_PAIR_MEMBER
+            elif view.locked:
                 color = COLOR_LOCKED
             elif getattr(view, "predicted", False):
-                # Kalman tahmini — ölçüm yok, kutu ilerliyor
                 color = (180, 180, 220)
             elif is_balloon:
-                # Aşama-3: balon IFF rengi (üstünde kırmızı=düşman, camgöbeği=dost)
                 if view.is_friendly is True:
                     color = COLOR_FRIEND
                 elif view.is_friendly is False:
@@ -292,6 +304,26 @@ class VisionWorker(BaseWorker):
                 color=color,
                 track_id=view.track_id,
             ))
+
+        # Birleşik kutu en üste: düşman kırmızı, dost yeşil
+        if stage in (2, 3):
+            for pair in pairs:
+                if pair.locked:
+                    color = COLOR_LOCKED
+                elif pair.is_friendly is True:
+                    color = COLOR_PAIR_UNION_FRIEND
+                elif pair.is_friendly is False:
+                    color = COLOR_PAIR_UNION_FOE
+                else:
+                    color = COLOR_PAIR_UNION
+                drawables.append(Detection(
+                    bbox_xyxy=pair.bbox,
+                    cls_id=-1,
+                    cls_name=pair.display_name,
+                    confidence=pair.confidence,
+                    color=color,
+                    track_id=None,
+                ))
 
         total_ms = float(getattr(result, "total_ms", 0.0) or 0.0)
         fps = (1000.0 / total_ms) if total_ms > 1.0 else 0.0

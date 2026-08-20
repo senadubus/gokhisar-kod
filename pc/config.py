@@ -78,6 +78,9 @@ SERVO_PAN_HOME_DEG = 90.0
 SERVO_TILT_HOME_DEG = 80.0
 SERVO_ELEVATION_HOME_UI = -10  # -15 fazla aşağıydı
 
+# Otonom nişan yatay yön (manuel'e dokunma). True → cx ayna.
+SERVO_INVERT_PAN_AUTO = True
+
 # ---------------- Değerlendirme / Önceliklendirme (5 Ölçüt) ----------------
 W_SIZE = 0.35                  # hedef boyut ağırlığı
 W_CENTER = 0.25                # kamera merkezine yakınlık ağırlığı

@@ -88,6 +88,20 @@ class TrackView:
 
 
 @dataclass
+class PairView:
+    """Doğrulanmış maket+balon ikilisi — birleşik çizim kutusu."""
+
+    bbox: tuple[float, float, float, float]
+    member_track_ids: tuple[int, ...]
+    display_name: str
+    confidence: float
+    iff: str
+    is_friendly: bool | None
+    is_candidate: bool = False
+    locked: bool = False
+
+
+@dataclass
 class PipelineResult:
     """Tek bir karenin boru hattı çıktısı."""
 
@@ -95,6 +109,7 @@ class PipelineResult:
     frame_height: int
     detections: list[Detection] = field(default_factory=list)
     tracks: list[TrackView] = field(default_factory=list)
+    pairs: list[PairView] = field(default_factory=list)
     candidate: TrackView | None = None
     locked: bool = False
     servo_target: tuple[float, float] | None = None
@@ -278,6 +293,7 @@ class VisionPipeline:
         new_ids, lost_ids = self._sync_track_bookkeeping(tracked)
 
         views = self._build_track_views(tracked, candidate, locked)
+        pairs = self._build_pair_views(validated, tracked, views, candidate, locked)
         candidate_view = next(
             (v for v in views if candidate is not None
              and v.track_id == candidate.track_id), None)
@@ -295,6 +311,7 @@ class VisionPipeline:
             frame_height=height,
             detections=detections,
             tracks=views,
+            pairs=pairs,
             candidate=candidate_view,
             locked=locked,
             servo_target=servo_target,
@@ -666,3 +683,86 @@ class VisionPipeline:
             ))
         views.sort(key=lambda v: v.priority, reverse=True)
         return views
+
+    def _build_pair_views(
+        self,
+        validated,
+        tracked: dict[int, TrackedTarget],
+        views: list[TrackView],
+        candidate: TrackedTarget | None,
+        locked: bool,
+    ) -> list[PairView]:
+        """Maket+balon ikilileri için birleşik kutu (aşama 2/3 çizimi)."""
+        if self.stage not in (2, 3) or not validated:
+            return []
+
+        view_by_id = {v.track_id: v for v in views}
+        candidate_id = candidate.track_id if candidate else None
+        pairs: list[PairView] = []
+
+        for operational in validated:
+            model_tid = self._best_track_id(
+                tracked, operational.model_det, MODEL_CLASS_IDS
+            )
+            balloon_tid = self._best_track_id(
+                tracked, operational.balloon_det, {BALLOON_CLASS_ID}
+            )
+            members = tuple(
+                tid for tid in (model_tid, balloon_tid) if tid is not None
+            )
+            x1 = min(operational.model_det.x1, operational.balloon_det.x1)
+            y1 = min(operational.model_det.y1, operational.balloon_det.y1)
+            x2 = max(operational.model_det.x2, operational.balloon_det.x2)
+            y2 = max(operational.model_det.y2, operational.balloon_det.y2)
+
+            # IFF / aday: maket izi öncelikli, yoksa balon
+            primary = None
+            for tid in (model_tid, balloon_tid):
+                if tid is not None and tid in view_by_id:
+                    primary = view_by_id[tid]
+                    break
+            model_name = self.class_map.display_name_for_config_id(
+                operational.model_det.class_id
+            )
+            label = f"{model_name}+Balon"
+            if primary is not None:
+                if primary.locked or (locked and candidate_id in members):
+                    label = f"{label} [KİLİT]"
+                elif primary.is_candidate or candidate_id in members:
+                    label = f"{label} [ADAY]"
+                iff_txt = primary.iff
+                is_friendly = primary.is_friendly
+            else:
+                iff_txt = IFF_LABEL_TEXT[IFFLabel.UNKNOWN]
+                is_friendly = None
+
+            conf = max(
+                float(operational.model_det.conf),
+                float(operational.balloon_det.conf),
+            )
+            pairs.append(PairView(
+                bbox=(x1, y1, x2, y2),
+                member_track_ids=members,
+                display_name=label,
+                confidence=conf,
+                iff=iff_txt,
+                is_friendly=is_friendly,
+                is_candidate=bool(candidate_id in members) if candidate_id else False,
+                locked=bool(locked and candidate_id in members) if candidate_id else False,
+            ))
+        return pairs
+
+    @staticmethod
+    def _best_track_id(
+        tracked: dict[int, TrackedTarget],
+        det: Detection,
+        class_ids: set[int],
+    ) -> int | None:
+        best_id, best_iou = None, _VALIDATION_IOU
+        for track_id, target in tracked.items():
+            if target.det.class_id not in class_ids:
+                continue
+            score = _iou(target.det, det)
+            if score > best_iou:
+                best_id, best_iou = track_id, score
+        return best_id

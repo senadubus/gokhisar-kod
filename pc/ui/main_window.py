@@ -717,6 +717,9 @@ class MainWindow(QMainWindow):
         oy = float(getattr(config, "AIM_OFFSET_Y_PX", 0.0))
         cx = float(candidate.center[0]) + ox
         cy = float(candidate.center[1]) + oy
+        # Otonom pan tersi — yalnız SERVO_INVERT_PAN_AUTO (manuel ayrı)
+        if getattr(config, "SERVO_INVERT_PAN_AUTO", False):
+            cx = float(getattr(config, "FRAME_WIDTH", 640)) - cx
         t0 = time.perf_counter()
         self._rpi_worker.send_target(
             cx, cy, candidate.config_class_id, candidate.track_id, candidate.locked
